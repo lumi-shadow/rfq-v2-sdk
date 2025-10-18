@@ -1,0 +1,134 @@
+syntax = "proto2";
+
+package market_maker;
+
+// Token information
+message Token {
+    required string address = 1;
+    required uint32 decimals = 2;
+    required string symbol = 3;
+    required string owner = 4;
+}
+
+// Token pair information
+message TokenPair {
+    required Token base_token = 1;
+    required Token quote_token = 2;
+}
+
+// Price level for bid/ask
+message PriceLevel {
+    required uint64 volume = 1;  // Using string to handle large numbers and decimals
+    required uint64 price = 2;   // Using string to handle large numbers and decimals
+}
+
+// Cluster enumeration
+enum Cluster {
+    CLUSTER_UNSPECIFIED = 0;
+    CLUSTER_MAINNET = 1;
+    CLUSTER_DEVNET = 2;
+}
+
+// Main market maker quote message
+message MarketMakerQuote {
+    // Infrastructure fields
+    required uint64 timestamp = 1;           // Unix timestamp in microseconds
+    required uint64 sequence_number = 2;     // Monotonic sequence per MM
+    required uint64 quote_expiry_time = 3;   // Quote validity duration
+    required string maker_id = 4;            // Market maker identification
+    required string maker_address = 5;       // Maker address
+    required uint64 lot_size_base = 6;
+    // Core fields
+    required Cluster cluster = 7;            // mainnet/devnet
+    required TokenPair token_pair = 8;       // Token pair information
+    repeated PriceLevel bid_levels = 9;  // List of bid levels
+    repeated PriceLevel ask_levels = 10;  // List of ask levels
+}
+
+message MarketMakerSwap {
+    required SwapMessageType message_type = 1;
+    required string swap_uuid = 2;                  // Swap unique identifier
+    required string signed_transaction = 3;         // Solana signed transaction
+}
+
+// Service definition for market maker ingestion
+service MarketMakerIngestionService {
+    // Get the last sequence number for a maker (for synchronization)
+    rpc GetLastSequenceNumber(SequenceNumberRequest) returns (SequenceNumberResponse);
+    
+    // Get all orderbooks across all token pairs
+    rpc GetAllOrderbooks(GetAllOrderbooksRequest) returns (GetAllOrderbooksResponse);
+    
+    // Stream quotes (bidirectional streaming)
+    rpc StreamQuotes(stream MarketMakerQuote) returns (stream QuoteUpdate);
+
+    // Stream swaps (bidirectional streaming)
+    rpc StreamSwap(stream MarketMakerSwap) returns (stream SwapUpdate);
+}
+
+// Request to get the last sequence number for a maker
+message SequenceNumberRequest {
+    required string maker_id = 1;
+    required string auth_token = 2;  // Authentication token
+}
+
+// Response containing the last sequence number
+message SequenceNumberResponse {
+    required bool success = 1;
+    required uint64 last_sequence_number = 2;
+    required string message = 3;
+}
+
+// Quote update notification
+message QuoteUpdate {
+    required UpdateType update_type = 1;
+}
+
+message SwapUpdate {
+    required SwapMessageType message_type = 1;
+    optional string swap_uuid = 2;                    // Only present for SWAP_AVAILABLE and TRANSACTION_CONFIRMED
+    optional string unsigned_transaction = 3;         // Only present for SWAP_AVAILABLE
+    optional string transaction_signature = 4;        // Only present for TRANSACTION_CONFIRMED
+    optional string status_message = 5;               // For CONNECTION_READY and ERROR messages
+}
+
+enum SwapMessageType {
+    SWAP_MESSAGE_TYPE_PING = 0;
+    SWAP_MESSAGE_TYPE_PONG = 1;
+    SWAP_MESSAGE_TYPE_CONNECTION_READY = 2;         // Initial connection acknowledgment
+    SWAP_MESSAGE_TYPE_SWAP_AVAILABLE = 3;           // New swap available for signing
+    SWAP_MESSAGE_TYPE_SWAP_SUBMIT = 4;
+    SWAP_MESSAGE_TYPE_TRANSACTION_CONFIRMED = 5;    // Transaction submitted/confirmed
+    SWAP_MESSAGE_TYPE_ERROR = 6;                    // Error occurred
+}
+
+// Type of quote update
+enum UpdateType {
+    UPDATE_TYPE_UNSPECIFIED = 0;
+    UPDATE_TYPE_NEW = 1;
+    UPDATE_TYPE_UPDATED = 2;
+    UPDATE_TYPE_EXPIRED = 3;
+}
+
+// Orderbook for a specific token pair
+message Orderbook {
+    required TokenPair token_pair = 1;      // Required: token pair for this orderbook
+    repeated PriceLevel bid_levels = 2;     // All bid levels sorted by price (highest first)
+    repeated PriceLevel ask_levels = 3;     // All ask levels sorted by price (lowest first)
+    required uint64 last_updated = 4;       // Unix timestamp in microseconds
+    required string maker_address = 5;      // Maker Solana address
+    required uint64 expiry_time = 6;
+    required uint64 lot_size_base = 7;
+}
+
+// Request to get all orderbooks
+message GetAllOrderbooksRequest {
+    // Optional: filter by cluster (if not specified, returns all clusters)
+    optional Cluster cluster = 1;
+}
+
+// Response containing all orderbooks
+message GetAllOrderbooksResponse {
+    repeated Orderbook orderbooks = 1;
+    required uint64 timestamp = 2;  // When this snapshot was taken
+}
