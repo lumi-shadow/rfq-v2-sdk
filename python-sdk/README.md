@@ -6,8 +6,9 @@ Python SDK for Jupiter RFQ market maker integration via gRPC streaming.
 
 ```bash
 cd python-sdk
-python venv
-pip install -e .
+python -m venv ./venv
+source venv/bin/activate 
+pip install .
 ```
 
 Run the example:
