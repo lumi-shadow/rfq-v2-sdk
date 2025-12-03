@@ -1,10 +1,9 @@
-//! Main client implementation for the Market Maker SDK
+//! Main client implementation for the RFQv2 SDK
 
 use crate::error::{MarketMakerError, Result};
 use crate::market_maker::market_maker_ingestion_service_client::MarketMakerIngestionServiceClient;
 use crate::streaming::{QuoteStreamHandle, StreamConfig};
 use crate::types::*;
-use std::error::Error;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -12,7 +11,7 @@ use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::Request;
 use tracing::{debug, error, info, instrument, warn};
 
-/// Main client for interacting with the Market Maker Ingestion Service
+/// Main client for interacting with the RFQv2
 #[derive(Clone)]
 pub struct MarketMakerClient {
     inner: MarketMakerIngestionServiceClient<Channel>,
@@ -34,17 +33,17 @@ impl MarketMakerClient {
         Ok(request)
     }
 
-    /// Connect to the Market Maker service with default configuration
+    /// Connect to the RFQv2 service with default configuration
     #[instrument(skip(endpoint))]
     pub async fn connect<S: Into<String>>(endpoint: S) -> Result<Self> {
         let config = ClientConfig::new(endpoint.into());
         Self::connect_with_config(config).await
     }
 
-    /// Connect to the Market Maker service with custom configuration
+    /// Connect to the RFQv2 service with custom configuration
     #[instrument(skip(config))]
     pub async fn connect_with_config(config: ClientConfig) -> Result<Self> {
-        info!("Connecting to Market Maker service at {}", config.endpoint);
+        info!("Connecting to RFQv2 service at {}", config.endpoint);
 
         let mut endpoint = Endpoint::try_from(config.endpoint.clone())
             .map_err(|e| MarketMakerError::configuration(format!("Invalid endpoint: {}", e)))?
@@ -64,26 +63,13 @@ impl MarketMakerClient {
         }
 
         let channel = endpoint.connect().await.map_err(|e| {
-            // Provide helpful error messages for common TLS issues
-            if let Some(source) = e.source() {
-                let error_str = source.to_string();
-                if error_str.contains("UnknownIssuer") {
-                    error!("TLS Certificate Error: Unknown Certificate Issuer");
-                    return MarketMakerError::Connection(e);
-                } else if error_str.contains("InvalidCertificate") {
-                    error!("TLS Certificate Error: Invalid Certificate");
-                    return MarketMakerError::Connection(e);
-                } else if error_str.contains("BadSignature") {
-                    error!("TLS Certificate Error: Bad Certificate Signature");
-                    return MarketMakerError::Connection(e);
-                }
-            }
+            error!("Connection error: {}", e);
             MarketMakerError::Connection(e)
         })?;
 
         let inner = MarketMakerIngestionServiceClient::new(channel);
 
-        debug!("Successfully connected to Market Maker service with HTTP/2 protocol");
+        debug!("Successfully connected to RFQv2 service with HTTP/2 protocol");
 
         Ok(Self { inner, config })
     }
