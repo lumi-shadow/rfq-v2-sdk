@@ -1,15 +1,14 @@
-//! Production-ready streaming example with Birdeye price feeds and volume-based pricing
+//! Production-ready streaming example with DatAPI price feeds and volume-based pricing
 //! Also demonstrates swap streaming with transaction signing
 //! Uses integer arithmetic for precise financial calculations
 mod helpers;
-use crate::helpers::birdeye::BirdeyeClient;
+use crate::helpers::datapi::DatapiClient;
 use base64::prelude::*;
 use bs58;
 use market_maker_client_sdk::{
     streaming::swap_update_helpers,
     ClientConfig, MarketMakerClient, MarketMakerQuote, MarketMakerSwap, StreamConfig,
 };
-use rand::Rng;
 use solana_sdk::{
     signature::{Keypair, Signer},
     transaction::VersionedTransaction,
@@ -36,73 +35,55 @@ const PRICE_SCALE: u64 = 10_u64.pow(PRICE_DECIMALS);
 const SOL_SCALE: u64 = 10_u64.pow(SOL_DECIMALS);
 const BASIS_POINTS_SCALE: u64 = 10_000; // 10,000 basis points = 100%
 
-/// Volume tiers for SOL trading with corresponding price adjustments in basis points
-/// Format: (volume_in_lamports, markup_basis_points)
+/// Volume tiers for SOL trading with corresponding spread in basis points
+/// Format: (volume_in_lamports, spread_basis_points)
+/// Spread ranges from 1 to 4 BPS depending on trade size
 const VOLUME_TIERS: &[(u64, u64)] = &[
-    (1 * SOL_SCALE, 0),      // 1 SOL - no markup (0 basis points)
-    (10 * SOL_SCALE, 30),    // 10 SOL - 0.3% markup (30 basis points)
-    (100 * SOL_SCALE, 80),   // 100 SOL - 0.8% markup (80 basis points)
-    (1000 * SOL_SCALE, 150), // 1000 SOL - 1.5% markup (150 basis points)
-    (5000 * SOL_SCALE, 250), // 5000 SOL - 2.5% markup (250 basis points)
+    (1 * SOL_SCALE, 1),    // 1 SOL - 1 BPS spread
+    (10 * SOL_SCALE, 1),   // 10 SOL - 1 BPS spread
+    (100 * SOL_SCALE, 2),  // 100 SOL - 2 BPS spread
+    (1000 * SOL_SCALE, 3), // 1000 SOL - 3 BPS spread
+    (5000 * SOL_SCALE, 4), // 5000 SOL - 4 BPS spread
 ];
 
-/// Fetch the USD price of any token via Birdeye, returned as an integer
+/// Fetch USD prices for SOL and SPL token via DatAPI, returned as integers
 /// scaled by PRICE_SCALE (i.e. $1.23 => 1_230_000).
-async fn fetch_token_price(
-    birdeye_client: &BirdeyeClient,
-    token_address: &str,
-) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    let response = birdeye_client.fetch_current_price(token_address).await?;
+/// Returns (sol_price, Option<spl_token_price>).
+async fn fetch_token_prices(
+    datapi_client: &DatapiClient,
+) -> Result<(u64, Option<u64>), Box<dyn std::error::Error + Send + Sync>> {
+    let token_ids = vec![
+        SolanaTokens::SOL.to_string(),
+        SolanaTokens::SPL_TOKEN.to_string(),
+    ];
+    let response = datapi_client.fetch_prices(&token_ids).await?;
 
-    if !response.success {
-        return Err("Birdeye API returned success=false".into());
-    }
+    let sol_price = response
+        .get(SolanaTokens::SOL)
+        .map(|d| (d.usd_price * PRICE_SCALE as f64).round() as u64)
+        .ok_or("SOL price not found in DatAPI response")?;
 
-    // Convert float price to integer (multiply by PRICE_SCALE for 6 decimal precision)
-    let price_integer = (response.data.value * PRICE_SCALE as f64).round() as u64;
-    Ok(price_integer)
+    let spl_price = response
+        .get(SolanaTokens::SPL_TOKEN)
+        .map(|d| (d.usd_price * PRICE_SCALE as f64).round() as u64);
+
+    Ok((sol_price, spl_price))
 }
 
+/// Fetch only the SOL price via DatAPI
+#[allow(dead_code)]
 async fn fetch_sol_price(
-    birdeye_client: &BirdeyeClient,
+    datapi_client: &DatapiClient,
 ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-    fetch_token_price(birdeye_client, SolanaTokens::SOL).await
-}
+    let token_id = SolanaTokens::SOL.to_string();
+    let response = datapi_client.fetch_price(&token_id).await?;
 
-/// Fixed MCT/USDC price ratio: 1 MCT = 0.20 USDC (i.e. 5 MCT per 1 USDC)
-const SPL_TOKEN_BASE_PRICE: u64 = 200_000; // $0.20 in PRICE_SCALE units
-/// Maximum random drift applied to the SPL token price each cycle (±2%)
-const SPL_TOKEN_DRIFT_BP: u64 = 200;
+    let sol_price = response
+        .get(SolanaTokens::SOL)
+        .map(|d| (d.usd_price * PRICE_SCALE as f64).round() as u64)
+        .ok_or("SOL price not found in DatAPI response")?;
 
-/// Simulate a drifting SPL token price around the base price.
-/// Adds random noise within ±SPL_TOKEN_DRIFT_BP basis points.
-fn simulate_spl_token_price() -> u64 {
-    let mut rng = rand::thread_rng();
-    let drift: i64 = rng.gen_range(-(SPL_TOKEN_DRIFT_BP as i64)..=(SPL_TOKEN_DRIFT_BP as i64));
-    let adjustment = SPL_TOKEN_BASE_PRICE.saturating_mul(drift.unsigned_abs()) / BASIS_POINTS_SCALE;
-    if drift >= 0 {
-        SPL_TOKEN_BASE_PRICE.saturating_add(adjustment)
-    } else {
-        SPL_TOKEN_BASE_PRICE.saturating_sub(adjustment)
-    }
-}
-
-fn calculate_volume_adjusted_price(base_price: u64, volume_lamports: u64, is_ask: bool) -> u64 {
-    let markup_bp = VOLUME_TIERS
-        .iter()
-        .rev()
-        .find(|(tier_volume, _)| volume_lamports >= *tier_volume)
-        .map(|(_, markup)| *markup)
-        .unwrap_or(0);
-
-    let adjustment_bp = if is_ask { markup_bp } else { markup_bp / 2 };
-    let adjustment = base_price.saturating_mul(adjustment_bp) / BASIS_POINTS_SCALE;
-
-    if is_ask {
-        base_price.saturating_add(adjustment)
-    } else {
-        base_price.saturating_sub(adjustment)
-    }
+    Ok(sol_price)
 }
 
 /// Convert USDC amount (in integer format) to token volume in its smallest unit
@@ -122,32 +103,26 @@ fn usdc_to_sol_volume(usdc_amount: u64, sol_price: u64) -> u64 {
     usdc_to_token_volume(usdc_amount, sol_price, SOL_SCALE)
 }
 
-/// Calculate the exact price deviation for a given USDC input amount
+/// Get spread in basis points based on volume (1-4 BPS)
+fn get_spread_bp(volume_lamports: u64) -> u64 {
+    VOLUME_TIERS
+        .iter()
+        .rev()
+        .find(|(tier_volume, _)| volume_lamports >= *tier_volume)
+        .map(|(_, spread)| *spread)
+        .unwrap_or(1)
+}
+
+/// Calculate the price deviation for a given USDC input amount
 fn calculate_price_deviation_for_usdc(usdc_amount: u64, sol_price: u64) -> (u64, u64, u64) {
     let volume_lamports = usdc_to_sol_volume(usdc_amount, sol_price);
     let spread_bp = get_spread_bp(volume_lamports);
 
-    let bid_base = calculate_volume_adjusted_price(sol_price, volume_lamports, false);
-    let ask_base = calculate_volume_adjusted_price(sol_price, volume_lamports, true);
-
-    let bid_spread = bid_base.saturating_mul(spread_bp) / BASIS_POINTS_SCALE;
-    let ask_spread = ask_base.saturating_mul(spread_bp) / BASIS_POINTS_SCALE;
-
-    let final_bid = bid_base.saturating_sub(bid_spread);
-    let final_ask = ask_base.saturating_add(ask_spread);
+    let half_spread = sol_price.saturating_mul(spread_bp) / (BASIS_POINTS_SCALE * 2);
+    let final_bid = sol_price.saturating_sub(half_spread);
+    let final_ask = sol_price.saturating_add(half_spread);
 
     (final_bid, final_ask, volume_lamports)
-}
-
-/// Get spread in basis points based on volume
-fn get_spread_bp(volume_lamports: u64) -> u64 {
-    if volume_lamports < 10 * SOL_SCALE {
-        10
-    } else if volume_lamports < 1000 * SOL_SCALE {
-        20
-    } else {
-        30
-    }
 }
 
 /// Convert integer price to display format
@@ -438,7 +413,7 @@ async fn run_swap_stream(
     Ok(())
 }
 
-/// Build volume-tier levels for a given base price and apply randomness.
+/// Build volume-tier levels for a given base price.
 /// Returns (quote_builder, min_bid, max_ask) with all tiers added.
 fn build_volume_tiers(
     mut quote_builder: market_maker_client_sdk::builders::MarketMakerQuoteBuilder,
@@ -448,30 +423,14 @@ fn build_volume_tiers(
     u64,
     u64,
 ) {
-    let mut rng = rand::thread_rng();
-    let variance_bp = rng.gen_range(-50i64..=50i64);
-    let adjustment = base_price.saturating_mul(variance_bp.unsigned_abs()) / BASIS_POINTS_SCALE;
-    let adjusted_base_price = if variance_bp >= 0 {
-        base_price.saturating_add(adjustment)
-    } else {
-        base_price.saturating_sub(adjustment)
-    };
-
     let mut min_bid_price = u64::MAX;
     let mut max_ask_price = 0u64;
 
-    for (volume_lamports, _) in VOLUME_TIERS {
-        let spread_bp = get_spread_bp(*volume_lamports);
-        let bid_price =
-            calculate_volume_adjusted_price(adjusted_base_price, *volume_lamports, false);
-        let ask_price =
-            calculate_volume_adjusted_price(adjusted_base_price, *volume_lamports, true);
-
-        let bid_spread = bid_price.saturating_mul(spread_bp) / BASIS_POINTS_SCALE;
-        let ask_spread = ask_price.saturating_mul(spread_bp) / BASIS_POINTS_SCALE;
-
-        let final_bid = bid_price.saturating_sub(bid_spread);
-        let final_ask = ask_price.saturating_add(ask_spread);
+    for (volume, spread_bp) in VOLUME_TIERS {
+        // Apply half the spread to each side of the base price
+        let half_spread = base_price.saturating_mul(*spread_bp) / (BASIS_POINTS_SCALE * 2);
+        let final_bid = base_price.saturating_sub(half_spread);
+        let final_ask = base_price.saturating_add(half_spread);
 
         if final_bid < min_bid_price && final_bid > 0 {
             min_bid_price = final_bid;
@@ -481,8 +440,8 @@ fn build_volume_tiers(
         }
 
         quote_builder = quote_builder
-            .bid_level(*volume_lamports, final_bid)
-            .ask_level(*volume_lamports, final_ask);
+            .bid_level(*volume, final_bid)
+            .ask_level(*volume, final_ask);
     }
 
     (quote_builder, min_bid_price, max_ask_price)
@@ -567,7 +526,7 @@ async fn run_quote_stream(
     mut next_sequence: u64,
     maker_id: &str,
     maker_address: &str,
-    birdeye_client: &BirdeyeClient,
+    datapi_client: &DatapiClient,
     mut sol_price: u64,
     mut spl_token_price: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -578,28 +537,32 @@ async fn run_quote_stream(
     let spl_pair = spl_token_usdc_pair();
 
     loop {
-        // Refresh prices periodically
+        // Refresh prices periodically from DatAPI
         if price_refresh_counter >= price_refresh_interval {
-            if let Ok(new_price) = fetch_sol_price(birdeye_client).await {
-                let price_diff = new_price.abs_diff(sol_price);
-                if price_diff > PRICE_SCALE / 100 {
-                    info!(
-                        "Updated SOL price: ${} -> ${}",
-                        price_to_display(sol_price),
-                        price_to_display(new_price)
-                    );
-                    sol_price = new_price;
+            match fetch_token_prices(datapi_client).await {
+                Ok((new_sol_price, new_spl_price)) => {
+                    if new_sol_price.abs_diff(sol_price) > PRICE_SCALE / 100 {
+                        info!(
+                            "Updated SOL price: ${} -> ${}",
+                            price_to_display(sol_price),
+                            price_to_display(new_sol_price)
+                        );
+                        sol_price = new_sol_price;
+                    }
+                    if let Some(new_spl) = new_spl_price {
+                        if new_spl.abs_diff(spl_token_price) > PRICE_SCALE / 100 {
+                            info!(
+                                "Updated MCT price: ${} -> ${}",
+                                price_to_display(spl_token_price),
+                                price_to_display(new_spl)
+                            );
+                            spl_token_price = new_spl;
+                        }
+                    }
                 }
-            }
-            // Simulate SPL token price drift (no Birdeye feed for newly created token)
-            let new_spl_price = simulate_spl_token_price();
-            if new_spl_price != spl_token_price {
-                info!(
-                    "Simulated MCT price: ${} -> ${}",
-                    price_to_display(spl_token_price),
-                    price_to_display(new_spl_price)
-                );
-                spl_token_price = new_spl_price;
+                Err(e) => {
+                    warn!("Failed to refresh prices from DatAPI: {}", e);
+                }
             }
             price_refresh_counter = 0;
         }
@@ -609,7 +572,7 @@ async fn run_quote_stream(
             .maker_id(maker_id)
             .sol_usdc_pair()
             .sequence_number(next_sequence)
-            .expiry_time_secs(2)
+            .expiry_time_secs(60)
             .maker_address(maker_address.to_string())
             .lot_size_base(10u64.pow(3));
 
@@ -735,29 +698,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load or generate a keypair for transaction signing
     let keypair = load_or_generate_keypair()?;
 
-    // Initialize Birdeye client for price fetching
-    let birdeye_api_key = load_env_or_default(
-        "BIRDEYE_API_KEY",
-        "your_api_key",
-        "BIRDEYE_API_KEY not set - using placeholder (API requests may fail)",
+    // Initialize DatAPI client for price fetching
+    let datapi_url = load_env_or_default(
+        "DATAPI_URL",
+        "https://datapi.jup.ag",
+        "DATAPI_URL not set - using default https://datapi.jup.ag",
     );
-    let birdeye_client = BirdeyeClient::new("https://public-api.birdeye.so", &birdeye_api_key);
+    let datapi_client = DatapiClient::new(&datapi_url);
 
-    // Fetch initial SOL price from Birdeye
-    let sol_price = match fetch_sol_price(&birdeye_client).await {
-        Ok(price) => {
-            info!("SOL price: ${}", price_to_display(price));
+    // Fetch initial prices from DatAPI
+    let (sol_price, spl_token_price) = match fetch_token_prices(&datapi_client).await {
+        Ok((sol, spl)) => {
+            info!("SOL price: ${}", price_to_display(sol));
 
             // Demonstrate price deviation calculation for 1,000,000 USDC
             let usdc_amount = 1_000_000 * PRICE_SCALE;
             let (bid, ask, volume_lamports) =
-                calculate_price_deviation_for_usdc(usdc_amount, price);
+                calculate_price_deviation_for_usdc(usdc_amount, sol);
 
-            let price_safe = price.max(1);
+            let price_safe = sol.max(1);
             let bid_deviation =
-                (price.saturating_sub(bid)).saturating_mul(BASIS_POINTS_SCALE) / price_safe;
+                (sol.saturating_sub(bid)).saturating_mul(BASIS_POINTS_SCALE) / price_safe;
             let ask_deviation =
-                (ask.saturating_sub(price)).saturating_mul(BASIS_POINTS_SCALE) / price_safe;
+                (ask.saturating_sub(sol)).saturating_mul(BASIS_POINTS_SCALE) / price_safe;
             let spread_bp =
                 (ask.saturating_sub(bid)).saturating_mul(BASIS_POINTS_SCALE) / price_safe;
 
@@ -771,22 +734,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 basis_points_to_percentage(spread_bp)
             );
 
-            price
+            let spl_price = match spl {
+                Some(price) => {
+                    info!("MCT price: ${}", price_to_display(price));
+                    price
+                }
+                None => {
+                    warn!("MCT price not available from DatAPI — using fallback $0.20");
+                    200_000 // $0.20 in PRICE_SCALE units
+                }
+            };
+
+            (sol, spl_price)
         }
         Err(e) => {
-            warn!("Failed to fetch SOL price: {}. Using fallback $100.00", e);
-            100 * PRICE_SCALE
+            warn!("Failed to fetch prices from DatAPI: {}. Using fallbacks", e);
+            (100 * PRICE_SCALE, 200_000)
         }
     };
-
-    // SPL token is newly created — no market price available.
-    // Use fixed 1:5 ratio to USDC ($0.20 per MCT) with simulated spread.
-    let spl_token_price = simulate_spl_token_price();
-    info!(
-        "MCT price (simulated): ${} (base $0.20, ±{}bp drift)",
-        price_to_display(spl_token_price),
-        SPL_TOKEN_DRIFT_BP
-    );
 
     info!(
         "Streaming orderbooks for: SOL/USDC (${}) and MCT/USDC (${})",
@@ -874,7 +839,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_sequence,
         &maker_id,
         &keypair.pubkey().to_string(),
-        &birdeye_client,
+        &datapi_client,
         sol_price,
         spl_token_price,
     )
