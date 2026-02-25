@@ -34,16 +34,17 @@ const SPL_TOKEN_SCALE: u64 = 10_u64.pow(SPL_TOKEN_DECIMALS);
 const PRICE_SCALE: u64 = 10_u64.pow(PRICE_DECIMALS);
 const SOL_SCALE: u64 = 10_u64.pow(SOL_DECIMALS);
 const BASIS_POINTS_SCALE: u64 = 10_000; // 10,000 basis points = 100%
+const PRICE_IMPROVEMENT_BP: u64 = 7; // 5 BPS improvement per side
 
 /// Volume tiers for SOL trading with corresponding spread in basis points
 /// Format: (volume_in_lamports, spread_basis_points)
-/// Spread ranges from 1 to 4 BPS depending on trade size
+/// Spreads are set to 0 across all tiers for maximum competitiveness
 const VOLUME_TIERS: &[(u64, u64)] = &[
-    (1 * SOL_SCALE, 1),    // 1 SOL - 1 BPS spread
-    (10 * SOL_SCALE, 1),   // 10 SOL - 1 BPS spread
-    (100 * SOL_SCALE, 2),  // 100 SOL - 2 BPS spread
-    (1000 * SOL_SCALE, 3), // 1000 SOL - 3 BPS spread
-    (5000 * SOL_SCALE, 4), // 5000 SOL - 4 BPS spread
+    (1 * SOL_SCALE, 0),    // 1 SOL - 0 BPS spread
+    (10 * SOL_SCALE, 0),   // 10 SOL - 0 BPS spread
+    (100 * SOL_SCALE, 0),  // 100 SOL - 0 BPS spread
+    (1000 * SOL_SCALE, 0), // 1000 SOL - 0 BPS spread
+    (5000 * SOL_SCALE, 0), // 5000 SOL - 0 BPS spread
 ];
 
 /// Fetch USD prices for SOL and SPL token via DatAPI, returned as integers
@@ -119,8 +120,9 @@ fn calculate_price_deviation_for_usdc(usdc_amount: u64, sol_price: u64) -> (u64,
     let spread_bp = get_spread_bp(volume_lamports);
 
     let half_spread = sol_price.saturating_mul(spread_bp) / (BASIS_POINTS_SCALE * 2);
-    let final_bid = sol_price.saturating_sub(half_spread);
-    let final_ask = sol_price.saturating_add(half_spread);
+    let improvement = sol_price.saturating_mul(PRICE_IMPROVEMENT_BP) / BASIS_POINTS_SCALE;
+    let final_bid = sol_price.saturating_sub(half_spread).saturating_add(improvement);
+    let final_ask = sol_price.saturating_add(half_spread).saturating_sub(improvement);
 
     (final_bid, final_ask, volume_lamports)
 }
@@ -427,10 +429,12 @@ fn build_volume_tiers(
     let mut max_ask_price = 0u64;
 
     for (volume, spread_bp) in VOLUME_TIERS {
-        // Apply half the spread to each side of the base price
+        // Apply half the spread to each side, then add price improvement
+        // Improvement pushes bid UP and ask DOWN (we lose edge to be competitive)
         let half_spread = base_price.saturating_mul(*spread_bp) / (BASIS_POINTS_SCALE * 2);
-        let final_bid = base_price.saturating_sub(half_spread);
-        let final_ask = base_price.saturating_add(half_spread);
+        let improvement = base_price.saturating_mul(PRICE_IMPROVEMENT_BP) / BASIS_POINTS_SCALE;
+        let final_bid = base_price.saturating_sub(half_spread).saturating_add(improvement);
+        let final_ask = base_price.saturating_add(half_spread).saturating_sub(improvement);
 
         if final_bid < min_bid_price && final_bid > 0 {
             min_bid_price = final_bid;
@@ -611,7 +615,7 @@ async fn run_quote_stream(
             .maker_id(maker_id)
             .token_pair(spl_pair.clone())
             .sequence_number(next_sequence)
-            .expiry_time_secs(2)
+            .expiry_time_secs(60)
             .maker_address(maker_address.to_string())
             .lot_size_base(10u64.pow(SPL_TOKEN_DECIMALS - PRICE_DECIMALS)); // 10^(base_decimals - quote_decimals)
 
