@@ -51,7 +51,10 @@ impl DatapiClient {
     }
 
     #[allow(dead_code)]
-    pub async fn fetch_price(&self, token_id: &String) -> Result<DatapiResponse, Box<dyn Error + Send + Sync>> {
+    pub async fn fetch_price(
+        &self,
+        token_id: &String,
+    ) -> Result<DatapiResponse, Box<dyn Error + Send + Sync>> {
         self.fetch_prices(&[token_id.clone()]).await
     }
 }

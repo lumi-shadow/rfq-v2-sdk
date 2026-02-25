@@ -6,8 +6,8 @@ use crate::helpers::datapi::DatapiClient;
 use base64::prelude::*;
 use bs58;
 use market_maker_client_sdk::{
-    streaming::swap_update_helpers,
-    ClientConfig, MarketMakerClient, MarketMakerQuote, MarketMakerSwap, StreamConfig,
+    streaming::swap_update_helpers, ClientConfig, MarketMakerClient, MarketMakerQuote,
+    MarketMakerSwap, StreamConfig,
 };
 use solana_sdk::{
     signature::{Keypair, Signer},
@@ -121,8 +121,12 @@ fn calculate_price_deviation_for_usdc(usdc_amount: u64, sol_price: u64) -> (u64,
 
     let half_spread = sol_price.saturating_mul(spread_bp) / (BASIS_POINTS_SCALE * 2);
     let improvement = sol_price.saturating_mul(PRICE_IMPROVEMENT_BP) / BASIS_POINTS_SCALE;
-    let final_bid = sol_price.saturating_sub(half_spread).saturating_add(improvement);
-    let final_ask = sol_price.saturating_add(half_spread).saturating_sub(improvement);
+    let final_bid = sol_price
+        .saturating_sub(half_spread)
+        .saturating_add(improvement);
+    let final_ask = sol_price
+        .saturating_add(half_spread)
+        .saturating_sub(improvement);
 
     (final_bid, final_ask, volume_lamports)
 }
@@ -433,8 +437,12 @@ fn build_volume_tiers(
         // Improvement pushes bid UP and ask DOWN (we lose edge to be competitive)
         let half_spread = base_price.saturating_mul(*spread_bp) / (BASIS_POINTS_SCALE * 2);
         let improvement = base_price.saturating_mul(PRICE_IMPROVEMENT_BP) / BASIS_POINTS_SCALE;
-        let final_bid = base_price.saturating_sub(half_spread).saturating_add(improvement);
-        let final_ask = base_price.saturating_add(half_spread).saturating_sub(improvement);
+        let final_bid = base_price
+            .saturating_sub(half_spread)
+            .saturating_add(improvement);
+        let final_ask = base_price
+            .saturating_add(half_spread)
+            .saturating_sub(improvement);
 
         if final_bid < min_bid_price && final_bid > 0 {
             min_bid_price = final_bid;
@@ -473,9 +481,7 @@ fn spl_token_usdc_pair() -> market_maker_client_sdk::types::TokenPair {
 /// Drain all pending QuoteUpdate messages from the server, logging each one verbosely.
 /// This must be called between sends to prevent unconsumed responses from causing
 /// gRPC flow-control back-pressure which can lead to connection drops.
-async fn drain_quote_updates(
-    stream: &mut market_maker_client_sdk::streaming::QuoteStreamHandle,
-) {
+async fn drain_quote_updates(stream: &mut market_maker_client_sdk::streaming::QuoteStreamHandle) {
     loop {
         match stream
             .receive_update_timeout(Duration::from_millis(200))
@@ -507,19 +513,14 @@ fn log_quote_update(update: &market_maker_client_sdk::QuoteUpdate) {
     } else if update_helpers::is_expired_quote(update) {
         warn!("Server: quote EXPIRED");
     } else if update_helpers::is_rejected_quote(update) {
-        let reason = update_helpers::get_status_message(update)
-            .unwrap_or("no reason provided");
-        error!(
-            "Server REJECTED quote — reason: {}",
-            reason
-        );
+        let reason = update_helpers::get_status_message(update).unwrap_or("no reason provided");
+        error!("Server REJECTED quote — reason: {}", reason);
     } else if update_helpers::is_heartbeat(update) {
         info!("Server heartbeat received");
     } else {
         warn!(
             "Unknown update_type={}, status_message={:?}",
-            update.update_type,
-            update.status_message
+            update.update_type, update.status_message
         );
     }
 }
@@ -717,8 +718,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Demonstrate price deviation calculation for 1,000,000 USDC
             let usdc_amount = 1_000_000 * PRICE_SCALE;
-            let (bid, ask, volume_lamports) =
-                calculate_price_deviation_for_usdc(usdc_amount, sol);
+            let (bid, ask, volume_lamports) = calculate_price_deviation_for_usdc(usdc_amount, sol);
 
             let price_safe = sol.max(1);
             let bid_deviation =
