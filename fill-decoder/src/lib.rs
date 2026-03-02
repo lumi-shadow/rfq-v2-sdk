@@ -2,12 +2,14 @@
 //!
 //! Decoder and analysis utilities for RFQ v2 `fill_exact_in` transactions on Solana.
 
+pub mod aggregator;
 pub mod analysis;
 pub mod decode;
 pub mod error;
 pub mod scanner;
 pub mod transaction;
 pub mod types;
+pub mod validation;
 pub use error::{FillDecoderError, Result};
 
 pub use types::{
@@ -23,10 +25,19 @@ pub use analysis::analyze_fill;
 
 pub use scanner::scan_for_embedded_fill;
 
+pub use aggregator::{decode_jupiter_rfq_fill, is_jupiter_route, AGGREGATOR_IDL_JSON, JUPITER_PROGRAM_ID};
+
+/// The Anchor IDL for the RFQ v2 program, embedded at compile time.
+pub const IDL_JSON: &str = include_str!("../idls/rfq_v2.json");
+
 pub use transaction::{
     decode_message_base64, decode_transaction_base64, decode_transaction_bytes, AddressTableLookup,
     DecodedInstruction, DecodedMessage, DecodedTransaction, MessageHeader, MessageVersion,
     ResolvedAccount,
+};
+
+pub use validation::{
+    all_exclusive, check_fill_exclusivity, check_fill_exclusivity_multi, ExclusivityReport,
 };
 
 #[cfg(test)]
@@ -327,5 +338,71 @@ mod tests {
 
         // Print full decoded output for inspection
         println!("{}", tx);
+    }
+
+    // ---- Validation tests ----
+
+    #[test]
+    fn test_fill_exclusivity_real_tx() {
+        let tx = decode_transaction_base64(REAL_TX2_BASE64).unwrap();
+        let msg = &tx.message;
+
+        // Maker accounts from the fill_exact_in (positions 4 and 5 in the IDL):
+        let maker_base = "FmQGEXvc2houbBgw1HVPYf7gA6JBxzhCMUQWK1tky7B9";
+        let maker_quote = "FUU2uSdMnTVcZWesD5Fen8AJUs7mSMdnM6qKMUCnqVw6";
+        let fill_authority = "917Yp1mesMs14d32kDwH4uNocdhuB67QzzaYKezkjy4B";
+
+        // Each maker account should appear exclusively in the fill instruction.
+        let report = check_fill_exclusivity(msg, maker_base);
+        assert!(report.is_exclusive(), "maker_base: {}", report);
+        assert_eq!(report.fill_instruction_indices, vec![2]);
+
+        let report = check_fill_exclusivity(msg, maker_quote);
+        assert!(report.is_exclusive(), "maker_quote: {}", report);
+
+        let report = check_fill_exclusivity(msg, fill_authority);
+        assert!(report.is_exclusive(), "fill_authority: {}", report);
+
+        // Convenience: check all at once.
+        assert!(all_exclusive(msg, &[maker_base, maker_quote, fill_authority]));
+    }
+
+    #[test]
+    fn test_fill_exclusivity_non_existent_key() {
+        let tx = decode_transaction_base64(REAL_TX2_BASE64).unwrap();
+        let msg = &tx.message;
+
+        let report = check_fill_exclusivity(msg, "11111111111111111111111111111111");
+        assert!(!report.is_exclusive());
+        assert!(report.fill_instruction_indices.is_empty());
+        assert!(report.non_fill_instruction_indices.is_empty());
+    }
+
+    #[test]
+    fn test_fill_exclusivity_user_key_not_exclusive() {
+        // The user (taker) account appears in the Jupiter route instruction
+        // which contains the fill, so it IS exclusive in this single-route tx.
+        // But it also appears as a signer which is fine.
+        let tx = decode_transaction_base64(REAL_TX2_BASE64).unwrap();
+        let msg = &tx.message;
+
+        let user = "B8ttfFCJRyJivDLn19Q6uvndVCssTwkokLAgz22vyo1Q";
+        let report = check_fill_exclusivity(msg, user);
+        // The user shows up in the Jupiter fill instruction (ix 2) only.
+        assert!(report.is_exclusive(), "user: {}", report);
+    }
+
+    #[test]
+    fn test_fill_exclusivity_multi() {
+        let tx = decode_transaction_base64(REAL_TX2_BASE64).unwrap();
+        let msg = &tx.message;
+
+        let keys = [
+            "FmQGEXvc2houbBgw1HVPYf7gA6JBxzhCMUQWK1tky7B9",
+            "FUU2uSdMnTVcZWesD5Fen8AJUs7mSMdnM6qKMUCnqVw6",
+        ];
+        let reports = check_fill_exclusivity_multi(msg, &keys);
+        assert_eq!(reports.len(), 2);
+        assert!(reports.iter().all(|r| r.is_exclusive()));
     }
 }

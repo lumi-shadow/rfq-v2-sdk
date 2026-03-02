@@ -1,5 +1,6 @@
 //! Transaction and message decoding for Solana V0 / Legacy transactions.
 
+use crate::aggregator::decode_jupiter_rfq_fill;
 use crate::analysis::analyze_fill;
 use crate::decode::{
     decode_fill_instruction, is_fill_exact_in, read_u8, FILL_ACCOUNT_LABELS, RFQ_V2_PROGRAM_ID,
@@ -353,7 +354,9 @@ fn parse_message(data: &[u8], offset: &mut usize) -> crate::Result<DecodedMessag
                     .ok()
                     .and_then(|ix| analyze_fill(&ix).ok().map(|a| (ix, a)))
             } else {
-                scan_for_embedded_fill(&raw.data)
+                // Try IDL-based aggregator decoding first, then heuristic scan.
+                decode_jupiter_rfq_fill(&raw.data)
+                    .or_else(|| scan_for_embedded_fill(&raw.data))
             };
 
             let accounts: Vec<ResolvedAccount> = raw

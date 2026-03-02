@@ -13,6 +13,7 @@ repository = "https://github.com/jup-ag/rfq-v2-sdk"
 thiserror = "1.0"
 bs58 = "0.5"
 base64 = "0.21"
+borsh = { version = "1", features = ["derive"] }
 
 # CLI-only (optional, pulled in by the binary)
 clap = { version = "4", features = ["derive", "env"], optional = true }

@@ -1,115 +1,96 @@
-//! Off-chain replay of the on-chain sweep logic for `fill_exact_in`.
+//! Off-chain sweep simulation for `fill_exact_in` instructions.
 
 use crate::error::FillDecoderError;
 use crate::types::{FillAnalysis, FillExactInInstruction, Side};
 
-/// Simulate the on-chain sweep and compute the expected fill outcome.
+/// Run the off-chain sweep simulation on a decoded `fill_exact_in` instruction.
 ///
-/// This mirrors the `sweep_quote_in_for_base` / `sweep_base_in_for_quote` logic from the RFQ v2 program so MMs can verify fills locally.
+/// Mirrors the on-chain logic: iterate through levels best-to-worst and fill
+/// as many lots as the input amount allows.
+///
+/// - **Bid** (taker buys base): input = quote-atoms, output = base-atoms.
+/// - **Ask** (taker sells base): input = base-atoms, output = quote-atoms.
 pub fn analyze_fill(ix: &FillExactInInstruction) -> crate::Result<FillAnalysis> {
-    let p = &ix.params;
-    let is_bid = ix.taker_side == Side::Bid;
+    let tick = ix.params.tick_size_qpb;
+    let lot = ix.params.lot_size_base;
+
+    if tick == 0 || lot == 0 {
+        return Err(FillDecoderError::validation(
+            "tick_size_qpb and lot_size_base must be > 0",
+        ));
+    }
+
     let mut remaining = ix.amount_in_atoms;
-    let mut bid_lots: u64 = 0;
-    let mut ask_quote: u64 = 0;
-    let mut weighted_px: u128 = 0;
+    let mut total_out: u64 = 0;
+    let mut total_lots: u64 = 0;
+    let mut weighted_px_sum: u128 = 0;
     let mut levels_consumed: usize = 0;
 
-    for lvl in &p.levels {
+    for level in &ix.params.levels {
         if remaining == 0 {
             break;
         }
-
-        let price_per_lot: u64 = (lvl.px_ticks as u128)
-            .checked_mul(p.tick_size_qpb as u128)
-            .and_then(|v| v.try_into().ok())
-            .ok_or_else(|| err("overflow: price_per_lot"))?;
-
-        // How many lots the taker can take from this level.
-        let lots = if is_bid {
-            if price_per_lot == 0 {
-                continue;
-            }
-            (remaining / price_per_lot).min(lvl.qty_lots)
-        } else {
-            let avail = remaining / p.lot_size_base;
-            if avail == 0 {
-                break;
-            }
-            avail.min(lvl.qty_lots)
-        };
-        if lots == 0 {
-            continue;
-        }
-
-        // Spend quote-atoms (Bid) or base-atoms (Ask).
-        let unit = if is_bid {
-            price_per_lot
-        } else {
-            p.lot_size_base
-        };
-        let spend = lots
-            .checked_mul(unit)
-            .ok_or_else(|| err("overflow: spend"))?;
-        remaining = remaining
-            .checked_sub(spend)
-            .ok_or_else(|| err("underflow: remaining"))?;
-
-        // Accumulate output.
-        if is_bid {
-            bid_lots = bid_lots
-                .checked_add(lots)
-                .ok_or_else(|| err("overflow: lots"))?;
-        } else {
-            let q = lots
-                .checked_mul(price_per_lot)
-                .ok_or_else(|| err("overflow: quote"))?;
-            ask_quote = ask_quote
-                .checked_add(q)
-                .ok_or_else(|| err("overflow: quote"))?;
-        }
-
-        weighted_px = weighted_px
-            .checked_add(
-                (lvl.px_ticks as u128)
-                    .checked_mul(lots as u128)
-                    .ok_or_else(|| err("overflow: weighted_px"))?,
-            )
-            .ok_or_else(|| err("overflow: weighted_px"))?;
-
         levels_consumed += 1;
+
+        let price_per_lot = level
+            .px_ticks
+            .checked_mul(tick)
+            .ok_or_else(|| FillDecoderError::other("price_per_lot overflow"))?;
+
+        match ix.taker_side {
+            Side::Bid => {
+                // Taker pays quote, receives base.
+                if price_per_lot == 0 {
+                    continue;
+                }
+                let affordable = remaining / price_per_lot;
+                let lots = affordable.min(level.qty_lots);
+                let cost = lots
+                    .checked_mul(price_per_lot)
+                    .ok_or_else(|| FillDecoderError::other("cost overflow"))?;
+                let base_out = lots
+                    .checked_mul(lot)
+                    .ok_or_else(|| FillDecoderError::other("base_out overflow"))?;
+                remaining -= cost;
+                total_out += base_out;
+                total_lots += lots;
+                weighted_px_sum += level.px_ticks as u128 * lots as u128;
+            }
+            Side::Ask => {
+                // Taker pays base, receives quote.
+                let affordable = remaining / lot;
+                let lots = affordable.min(level.qty_lots);
+                let base_cost = lots
+                    .checked_mul(lot)
+                    .ok_or_else(|| FillDecoderError::other("base_cost overflow"))?;
+                let quote_out = lots
+                    .checked_mul(price_per_lot)
+                    .ok_or_else(|| FillDecoderError::other("quote_out overflow"))?;
+                remaining -= base_cost;
+                total_out += quote_out;
+                total_lots += lots;
+                weighted_px_sum += level.px_ticks as u128 * lots as u128;
+            }
+        }
     }
 
-    let amount_spent = ix.amount_in_atoms - remaining;
-
-    let (amount_out, total_lots) = if is_bid {
-        let out = bid_lots
-            .checked_mul(p.lot_size_base)
-            .ok_or_else(|| err("overflow: out"))?;
-        (out, bid_lots)
-    } else {
-        (ask_quote, amount_spent / p.lot_size_base)
-    };
-
     let vwap_ticks = if total_lots > 0 {
-        (weighted_px / total_lots as u128) as u64
+        (weighted_px_sum / total_lots as u128) as u64
     } else {
         0
     };
 
+    let amount_spent = ix.amount_in_atoms - remaining;
+
     Ok(FillAnalysis {
         taker_side: ix.taker_side,
         amount_in_atoms: ix.amount_in_atoms,
-        amount_out_atoms: amount_out,
+        amount_out_atoms: total_out,
         vwap_ticks,
         levels_consumed,
         total_lots_filled: total_lots,
         amount_spent_atoms: amount_spent,
-        lot_size_base: p.lot_size_base,
-        tick_size_qpb: p.tick_size_qpb,
+        lot_size_base: lot,
+        tick_size_qpb: tick,
     })
-}
-
-fn err(msg: &str) -> FillDecoderError {
-    FillDecoderError::other(msg)
 }

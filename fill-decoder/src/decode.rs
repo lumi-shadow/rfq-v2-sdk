@@ -1,7 +1,7 @@
 //! Constants, detection, and low-level decoding for `fill_exact_in` instructions.
 
 use crate::error::FillDecoderError;
-use crate::types::{FillAccounts, FillExactInInstruction, FillExactInParams, Level, Side};
+use crate::types::{FillAccounts, FillExactInInstruction};
 
 /// Base-58 encoded RFQ v2 program ID.
 pub const RFQ_V2_PROGRAM_ID: &str = "fd3nMFYTQjX1yr5ER8u7tPdHJB7qt8RpDpNtLQX2Br5";
@@ -12,7 +12,7 @@ pub const FILL_EXACT_IN_DISCRIMINATOR: [u8; 8] = [222, 208, 6, 209, 154, 163, 54
 /// Number of accounts the `fill_exact_in` instruction expects.
 pub const FILL_EXACT_IN_ACCOUNT_COUNT: usize = 11;
 
-/// Labels for the 11 accounts in a `fill_exact_in` instruction.
+/// Labels for the 11 accounts in a `fill_exact_in` instruction (from the IDL).
 pub const FILL_ACCOUNT_LABELS: [&str; FILL_EXACT_IN_ACCOUNT_COUNT] = [
     "user",
     "fill_authority",
@@ -45,28 +45,6 @@ pub(crate) fn read_u8(data: &[u8], offset: &mut usize) -> crate::Result<u8> {
     Ok(val)
 }
 
-pub(crate) fn read_u32(data: &[u8], offset: &mut usize) -> crate::Result<u32> {
-    if *offset + 4 > data.len() {
-        return Err(FillDecoderError::other(
-            "unexpected end of instruction data",
-        ));
-    }
-    let val = u32::from_le_bytes(data[*offset..*offset + 4].try_into().unwrap());
-    *offset += 4;
-    Ok(val)
-}
-
-pub(crate) fn read_u64(data: &[u8], offset: &mut usize) -> crate::Result<u64> {
-    if *offset + 8 > data.len() {
-        return Err(FillDecoderError::other(
-            "unexpected end of instruction data",
-        ));
-    }
-    let val = u64::from_le_bytes(data[*offset..*offset + 8].try_into().unwrap());
-    *offset += 8;
-    Ok(val)
-}
-
 fn read_pubkey(keys: &[[u8; 32]], index: usize) -> crate::Result<[u8; 32]> {
     keys.get(index)
         .copied()
@@ -75,64 +53,16 @@ fn read_pubkey(keys: &[[u8; 32]], index: usize) -> crate::Result<[u8; 32]> {
 
 /// Decode the `fill_exact_in` instruction from raw instruction data bytes.
 ///
-/// The expected layout (Anchor / Borsh):
-/// ```text
-/// [0..8]   discriminator
-/// [8]      taker_side          (u8 enum)
-/// [9..17]  amount_in_atoms     (u64 LE)
-/// [17..25] expire_at           (u64 LE)
-/// [25..33] tick_size_qpb       (u64 LE)
-/// [33..41] lot_size_base       (u64 LE)
-/// [41..45] levels.len()        (u32 LE)
-/// [45..]   levels[]            (each: px_ticks u64 + qty_lots u64 = 16 bytes)
-/// ```
+/// Uses Borsh deserialization (matching Anchor's on-chain serialization)
+/// after skipping the 8-byte Anchor discriminator.
 pub fn decode_fill_instruction(data: &[u8]) -> crate::Result<FillExactInInstruction> {
     if !is_fill_exact_in(data) {
         return Err(FillDecoderError::validation(
             "instruction data does not match fill_exact_in discriminator",
         ));
     }
-
-    let mut offset: usize = 8; // skip discriminator
-
-    // taker_side
-    let side_byte = read_u8(data, &mut offset)?;
-    let taker_side = match side_byte {
-        0 => Side::Bid,
-        1 => Side::Ask,
-        other => {
-            return Err(FillDecoderError::validation(format!(
-                "invalid Side variant: {other}"
-            )))
-        }
-    };
-
-    // amount_in_atoms
-    let amount_in_atoms = read_u64(data, &mut offset)?;
-
-    // FillExactInParams
-    let expire_at = read_u64(data, &mut offset)?;
-    let tick_size_qpb = read_u64(data, &mut offset)?;
-    let lot_size_base = read_u64(data, &mut offset)?;
-
-    let num_levels = read_u32(data, &mut offset)? as usize;
-    let mut levels = Vec::with_capacity(num_levels);
-    for _ in 0..num_levels {
-        let px_ticks = read_u64(data, &mut offset)?;
-        let qty_lots = read_u64(data, &mut offset)?;
-        levels.push(Level { px_ticks, qty_lots });
-    }
-
-    Ok(FillExactInInstruction {
-        taker_side,
-        amount_in_atoms,
-        params: FillExactInParams {
-            expire_at,
-            tick_size_qpb,
-            lot_size_base,
-            levels,
-        },
-    })
+    borsh::from_slice::<FillExactInInstruction>(&data[8..])
+        .map_err(|e| FillDecoderError::other(format!("borsh deserialization failed: {e}")))
 }
 
 /// Map the instruction's account keys (in order) to named [`FillAccounts`].

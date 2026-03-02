@@ -1,7 +1,8 @@
 //! Core types for RFQ v2 `fill_exact_in` decoding and analysis.
 
 /// Which side the *taker* is on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, borsh::BorshDeserialize)]
+#[borsh(use_discriminant = true)]
 pub enum Side {
     /// Taker buys base (consumes ask levels).
     Bid = 0,
@@ -19,7 +20,7 @@ impl std::fmt::Display for Side {
 }
 
 /// A single price level in the orderbook.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, borsh::BorshDeserialize)]
 pub struct Level {
     /// Price in ticks – actual quote-atoms per lot = `px_ticks * tick_size_qpb`.
     pub px_ticks: u64,
@@ -28,7 +29,7 @@ pub struct Level {
 }
 
 /// Parameters embedded in the `fill_exact_in` instruction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, borsh::BorshDeserialize)]
 pub struct FillExactInParams {
     /// Unix timestamp (seconds) after which the quote is stale.
     pub expire_at: u64,
@@ -41,7 +42,7 @@ pub struct FillExactInParams {
 }
 
 /// Fully decoded `fill_exact_in` instruction data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, borsh::BorshDeserialize)]
 pub struct FillExactInInstruction {
     pub taker_side: Side,
     pub amount_in_atoms: u64,
