@@ -1,9 +1,4 @@
 //! Scan raw instruction data for an embedded `fill_exact_in` argument pattern.
-//!
-//! This is a **fallback** for unknown instruction formats.  The primary path
-//! for Jupiter route instructions is the IDL-based [`crate::aggregator`] decoder.
-//! The scanner locates a plausible levels-vector header, then uses Borsh
-//! deserialization to decode the surrounding struct — no manual byte reads.
 
 use std::io::Cursor;
 
@@ -13,10 +8,6 @@ use crate::analysis::analyze_fill;
 use crate::types::{FillAnalysis, FillExactInInstruction, FillExactInParams, Side};
 
 /// Scan raw instruction data for an embedded `fill_exact_in` argument pattern.
-///
-/// Uses a heuristic to locate the levels vector, then attempts Borsh
-/// deserialization at the calculated struct offset.  This avoids manual
-/// byte-level parsing and field-order guessing.
 pub fn scan_for_embedded_fill(data: &[u8]) -> Option<(FillExactInInstruction, FillAnalysis)> {
     // Minimum full instruction: side(1) + amount(8) + params(24 + 4 + 16) = 53
     if data.len() < 53 {

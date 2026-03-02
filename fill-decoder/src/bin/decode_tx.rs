@@ -1,20 +1,4 @@
 //! CLI tool for decoding RFQ v2 `fill_exact_in` transactions.
-//!
-//! ## Usage
-//!
-//! ```text
-//! # Decode a base-64 encoded transaction directly:
-//! decode-tx --base64 <BASE64_DATA>
-//!
-//! # Fetch and decode by signature:
-//! decode-tx --tx <SIGNATURE> --rpc-url https://api.mainnet-beta.solana.com
-//!
-//! # With fill-exclusivity check on maker accounts:
-//! decode-tx --tx <SIGNATURE> --check <PUBKEY1> --check <PUBKEY2>
-//!
-//! # Machine-readable JSON output:
-//! decode-tx --tx <SIGNATURE> --json
-//! ```
 
 use clap::Parser;
 
@@ -54,8 +38,6 @@ struct Cli {
     #[arg(long)]
     json: bool,
 }
-
-// ─── Minimal JSON-RPC helpers ────────────────────────────────────────────────
 
 mod rpc {
     use serde::{Deserialize, Serialize};
@@ -131,7 +113,6 @@ async fn fetch_transaction_base64(rpc_url: &str, signature: &str) -> Result<Stri
     Ok(result.transaction.0)
 }
 
-// ─── JSON serialisation helpers ──────────────────────────────────────────────
 // The lib types intentionally don't pull in serde, so we build JSON manually.
 
 fn fill_to_json(
@@ -219,13 +200,10 @@ fn tx_to_json(
     root
 }
 
-// ─── Entry point ─────────────────────────────────────────────────────────────
-
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
 
-    // ── Resolve base-64 input ────────────────────────────────────────────
     let b64 = if let Some(b64) = cli.base64.or(cli.message_hash) {
         b64
     } else if let Some(sig) = cli.tx {
@@ -246,7 +224,6 @@ async fn main() {
         std::process::exit(1);
     };
 
-    // ── Decode ───────────────────────────────────────────────────────────
     let tx = match fill_decoder::decode_transaction_base64(&b64) {
         Ok(tx) => tx,
         Err(e) => {
@@ -255,7 +232,6 @@ async fn main() {
         }
     };
 
-    // ── Exclusivity checks ───────────────────────────────────────────────
     let exclusivity: Vec<fill_decoder::ExclusivityReport> = if !cli.check_keys.is_empty() {
         let keys: Vec<&str> = cli.check_keys.iter().map(|s| s.as_str()).collect();
         fill_decoder::check_fill_exclusivity_multi(&tx.message, &keys)
@@ -263,7 +239,6 @@ async fn main() {
         Vec::new()
     };
 
-    // ── Output ───────────────────────────────────────────────────────────
     if cli.json {
         let json = tx_to_json(&tx, &exclusivity);
         println!("{}", serde_json::to_string_pretty(&json).unwrap());

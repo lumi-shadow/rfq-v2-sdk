@@ -52,9 +52,6 @@ fn read_pubkey(keys: &[[u8; 32]], index: usize) -> crate::Result<[u8; 32]> {
 }
 
 /// Decode the `fill_exact_in` instruction from raw instruction data bytes.
-///
-/// Uses Borsh deserialization (matching Anchor's on-chain serialization)
-/// after skipping the 8-byte Anchor discriminator.
 pub fn decode_fill_instruction(data: &[u8]) -> crate::Result<FillExactInInstruction> {
     if !is_fill_exact_in(data) {
         return Err(FillDecoderError::validation(

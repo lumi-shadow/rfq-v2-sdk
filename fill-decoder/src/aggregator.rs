@@ -14,8 +14,6 @@ pub const JUPITER_PROGRAM_ID: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV
 /// The Jupiter aggregator IDL, embedded at compile time.
 pub const AGGREGATOR_IDL_JSON: &str = include_str!("../idls/aggregator.json");
 
-// ─── Instruction discriminators (from the IDL) ──────────────────────────────
-
 const ROUTE: [u8; 8] = [229, 23, 203, 151, 122, 227, 173, 42];
 const ROUTE_WITH_TOKEN_LEDGER: [u8; 8] = [150, 86, 71, 116, 167, 93, 14, 104];
 const EXACT_OUT_ROUTE: [u8; 8] = [208, 51, 239, 151, 123, 43, 237, 92];
@@ -26,8 +24,6 @@ const ROUTE_V2: [u8; 8] = [187, 100, 250, 204, 49, 196, 175, 20];
 const EXACT_OUT_ROUTE_V2: [u8; 8] = [157, 138, 184, 82, 21, 244, 243, 36];
 const SHARED_ACCOUNTS_ROUTE_V2: [u8; 8] = [209, 152, 83, 147, 124, 254, 216, 233];
 const SHARED_ACCOUNTS_EXACT_OUT_ROUTE_V2: [u8; 8] = [53, 96, 229, 202, 216, 187, 250, 24];
-
-// ─── Supporting Borsh types ─────────────────────────────────────────────────
 
 #[derive(Debug, Clone, BorshDeserialize)]
 #[allow(dead_code)]
@@ -65,9 +61,6 @@ enum CandidateSwap {
 }
 
 /// All 126 Swap enum variants from the Jupiter aggregator IDL.
-///
-/// Variant ordering MUST match the IDL exactly — Borsh uses the variant
-/// index as the discriminant.
 #[derive(Debug, Clone, BorshDeserialize)]
 #[allow(dead_code)]
 enum Swap {
@@ -199,8 +192,6 @@ enum Swap {
     Quantum { side: JupSide },                           // 125
 }
 
-// ─── Route-plan step types ──────────────────────────────────────────────────
-
 #[derive(Debug, Clone, BorshDeserialize)]
 #[allow(dead_code)]
 struct RoutePlanStep {
@@ -218,8 +209,6 @@ struct RoutePlanStepV2 {
     input_index: u8,
     output_index: u8,
 }
-
-// ─── Instruction arg structs ────────────────────────────────────────────────
 
 #[derive(BorshDeserialize)]
 struct RouteArgs {
@@ -317,8 +306,6 @@ struct SharedAccountsExactOutRouteV2Args {
     #[allow(dead_code)] positive_slippage_bps: u16,
     route_plan: Vec<RoutePlanStepV2>,
 }
-
-// ─── Public API ─────────────────────────────────────────────────────────────
 
 /// Returns `true` if `instruction_data` begins with a known Jupiter route discriminator.
 pub fn is_jupiter_route(instruction_data: &[u8]) -> bool {
