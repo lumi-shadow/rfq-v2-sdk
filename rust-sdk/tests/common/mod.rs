@@ -8,126 +8,84 @@ use solana_sdk::{
 };
 use std::env;
 
-// ---------------------------------------------------------------------------
-// Well-known Solana mints
-// ---------------------------------------------------------------------------
-
 pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
-pub const SOL_MINT: &str = "So11111111111111111111111111111111111111112";
 pub const SPL_TOKEN_MINT: &str = "A3QAoKnf3jFcCfTGvEpE7KVBMZqXQJwvwt6Uc4UExkDp";
 
-// ---------------------------------------------------------------------------
-// Defaults
-// ---------------------------------------------------------------------------
-
-pub const DEFAULT_GRPC_ENDPOINT: &str = "https://rfq-mm-edge-grpc.raccoons.dev";
 pub const DEFAULT_ULTRA_API_BASE: &str = "https://preprod.ultra-api.jup.ag";
-
-// ---------------------------------------------------------------------------
-// Test configuration loaded from environment variables
-// ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 pub struct TestConfig {
-    /// gRPC service endpoint
-    pub grpc_endpoint: String,
-    /// Authentication token for gRPC calls
-    pub auth_token: String,
     /// Base URL for the preprod Ultra API
     pub ultra_api_base: String,
-    /// Input mint address (e.g. USDC)
+    /// Input mint address (default: USDC)
     pub input_mint: String,
-    /// Output mint address (e.g. SOL)
+    /// Output mint address (default: SPL_TOKEN_MINT)
     pub output_mint: String,
     /// Taker public key (Solana address)
     pub taker: String,
-    /// Taker keypair used for signing transactions
-    pub keypair: Keypair,
+    /// Taker keypair for signing (only when `SOLANA_PRIVATE_KEY` is set)
+    pub keypair: Option<Keypair>,
 }
 
 impl TestConfig {
     /// Build configuration from environment variables.
-    ///
-    /// # Panics
-    /// Panics when mandatory variables (`SOLANA_PRIVATE_KEY`, `MM_AUTH_TOKEN`) are missing.
     pub fn from_env() -> Self {
-        let private_key_str = env::var("SOLANA_PRIVATE_KEY")
-            .expect("SOLANA_PRIVATE_KEY env var is required (base58-encoded)");
-        let bytes = bs58::decode(private_key_str.trim())
-            .into_vec()
-            .expect("SOLANA_PRIVATE_KEY is not valid base58");
-        let keypair =
-            Keypair::try_from(&bytes[..]).expect("SOLANA_PRIVATE_KEY is not a valid keypair");
+        let keypair = env::var("SOLANA_PRIVATE_KEY").ok().map(|pk| {
+            let bytes = bs58::decode(pk.trim())
+                .into_vec()
+                .expect("SOLANA_PRIVATE_KEY is not valid base58");
+            Keypair::try_from(&bytes[..]).expect("SOLANA_PRIVATE_KEY is not a valid keypair")
+        });
 
-        let taker = env::var("TAKER").unwrap_or_else(|_| keypair.pubkey().to_string());
-
-        let auth_token = env::var("MM_AUTH_TOKEN").expect("MM_AUTH_TOKEN env var is required");
+        let taker = env::var("TAKER").unwrap_or_else(|_| {
+            keypair
+                .as_ref()
+                .expect("Either TAKER or SOLANA_PRIVATE_KEY must be set")
+                .pubkey()
+                .to_string()
+        });
 
         Self {
-            grpc_endpoint: env::var("GRPC_ENDPOINT")
-                .unwrap_or_else(|_| DEFAULT_GRPC_ENDPOINT.to_string()),
-            auth_token,
             ultra_api_base: env::var("ULTRA_API_BASE")
                 .unwrap_or_else(|_| DEFAULT_ULTRA_API_BASE.to_string()),
             input_mint: env::var("INPUT_MINT").unwrap_or_else(|_| USDC_MINT.to_string()),
-            output_mint: env::var("OUTPUT_MINT").unwrap_or_else(|_| SOL_MINT.to_string()),
+            output_mint: env::var("OUTPUT_MINT").unwrap_or_else(|_| SPL_TOKEN_MINT.to_string()),
             taker,
             keypair,
         }
     }
+
+    /// Return the keypair, panicking with a clear message if not available.
+    pub fn keypair(&self) -> &Keypair {
+        self.keypair
+            .as_ref()
+            .expect("SOLANA_PRIVATE_KEY is required for this test")
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Transaction signing helper
-// ---------------------------------------------------------------------------
-
 /// Decode a base64-encoded unsigned transaction, sign it with the given
-/// keypair at the correct signature index, and return the base64-encoded
-/// signed transaction.
+/// keypair, and return the base64-encoded signed transaction.
 pub fn sign_transaction(
     unsigned_tx_base64: &str,
     keypair: &Keypair,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let tx_bytes = BASE64_STANDARD.decode(unsigned_tx_base64)?;
+    let mut tx: VersionedTransaction = bincode::deserialize(&tx_bytes)?;
 
-    let mut transaction: VersionedTransaction = bincode::deserialize(&tx_bytes)?;
-
-    // Log some basic info
-    let version = match &transaction.message {
-        solana_sdk::message::VersionedMessage::V0(_) => "V0",
-        solana_sdk::message::VersionedMessage::Legacy(_) => "Legacy",
-    };
-    println!("  Transaction version: {version}");
-    println!("  Signatures count   : {}", transaction.signatures.len());
-
-    // Find the signature index that corresponds to our pubkey.
-    let account_keys = transaction.message.static_account_keys();
+    let account_keys = tx.message.static_account_keys();
     let taker_pubkey = keypair.pubkey();
     let signer_index = account_keys
         .iter()
         .position(|key| *key == taker_pubkey)
         .ok_or_else(|| {
             format!(
-                "Taker pubkey {} not found in transaction account keys: {:?}",
-                taker_pubkey,
-                account_keys
-                    .iter()
-                    .map(|k| k.to_string())
-                    .collect::<Vec<_>>()
+                "Taker pubkey {} not found in transaction account keys",
+                taker_pubkey
             )
         })?;
 
-    println!("  Taker pubkey       : {taker_pubkey}");
-    println!("  Signing at index   : {signer_index}");
+    let signature = keypair.sign_message(&tx.message.serialize());
+    tx.signatures[signer_index] = signature;
 
-    let message_data = transaction.message.serialize();
-    let signature = keypair.sign_message(&message_data);
-    transaction.signatures[signer_index] = signature;
-
-    let signed_tx_bytes = bincode::serialize(&transaction)?;
-    let signed_tx_base64 = BASE64_STANDARD.encode(&signed_tx_bytes);
-
-    println!("  Signed tx length   : {} bytes", signed_tx_bytes.len());
-
-    Ok(signed_tx_base64)
+    Ok(BASE64_STANDARD.encode(bincode::serialize(&tx)?))
 }

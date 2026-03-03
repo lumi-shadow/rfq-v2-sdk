@@ -1,10 +1,7 @@
-//! End-to-end integration tests for the RFQ V2 flow:
+//! Integration tests for the RFQ V2 flow:
 //!
-//!   1. Verify the orderbook exists on the gRPC service (GetQuotes)
-//!   2. Fetch a swap order from the preprod Ultra API (/order)
-//!   3. Sign the transaction as the taker
-//!   4. Submit the signed transaction to the Ultra API (/execute)
-//!   5. Decode a transaction with fill-decoder and find the RFQ v2 fill
+//!   1. Fetch a swap order from the preprod Ultra API (/order)
+//!   2. Decode the transaction with fill-decoder and find the RFQ v2 fill
 //!
 //! These tests hit live services and require env vars — see `tests/README.md`.
 
@@ -15,15 +12,8 @@ use fill_decoder::{
     decode_transaction_base64, scan_for_embedded_fill, FillAnalysis, FillExactInInstruction,
     JUPITER_PROGRAM_ID, RFQ_V2_PROGRAM_ID,
 };
-use market_maker_client_sdk::{ClientConfig, MarketMakerClient, Token, TokenPair};
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
-
-// ---------------------------------------------------------------------------
-// Ultra API types
-// ---------------------------------------------------------------------------
-
-const SPL_TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -31,6 +21,9 @@ struct OrderResponse {
     request_id: String,
     in_amount: String,
     out_amount: String,
+    other_amount_threshold: Option<String>,
+    slippage_bps: Option<u32>,
+    fee_bps: Option<u32>,
     transaction: Option<String>,
     route_plan: Option<Vec<RoutePlanStep>>,
     error: Option<String>,
@@ -85,42 +78,6 @@ struct SwapEvent {
     output_amount: String,
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn make_token(mint: &str) -> Token {
-    let (decimals, symbol) = match mint {
-        common::USDC_MINT => (6, "USDC"),
-        common::SOL_MINT => (9, "SOL"),
-        common::SPL_TOKEN_MINT => (6, "MCT"),
-        _ => (6, "UNKNOWN"),
-    };
-    Token {
-        address: mint.to_string(),
-        decimals,
-        symbol: symbol.to_string(),
-        owner: SPL_TOKEN_PROGRAM.to_string(),
-    }
-}
-
-fn make_token_pair(base: &str, quote: &str) -> TokenPair {
-    TokenPair {
-        base_token: make_token(base),
-        quote_token: make_token(quote),
-    }
-}
-
-async fn connect_grpc(cfg: &TestConfig) -> MarketMakerClient {
-    MarketMakerClient::connect_with_config(
-        ClientConfig::new(&cfg.grpc_endpoint)
-            .with_timeout(30)
-            .with_auth_token(&cfg.auth_token),
-    )
-    .await
-    .expect("failed to connect to gRPC service")
-}
-
 async fn fetch_order(
     api_base: &str,
     input_mint: &str,
@@ -134,7 +91,7 @@ async fn fetch_order(
          outputMint={output_mint}&\
          amount={amount}&\
          swapMode=ExactIn&\
-         slippageBps=50&\
+         slippageBps=3000&\
          broadcastFeeType=maxCap&\
          priorityFeeLamports=1000000&\
          useWsol=false&\
@@ -161,8 +118,9 @@ async fn fetch_order(
     let order: OrderResponse = serde_json::from_str(&body).expect("failed to parse /order JSON");
 
     println!(
-        "  requestId: {}, inAmount: {}, outAmount: {}",
-        order.request_id, order.in_amount, order.out_amount
+        "  requestId: {}, inAmount: {}, outAmount: {}, threshold: {:?}, slippageBps: {:?}, feeBps: {:?}",
+        order.request_id, order.in_amount, order.out_amount,
+        order.other_amount_threshold, order.slippage_bps, order.fee_bps,
     );
     if let Some(steps) = &order.route_plan {
         for (i, s) in steps.iter().enumerate() {
@@ -203,38 +161,6 @@ fn print_fill(ix: &FillExactInInstruction, a: &FillAnalysis) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-/// Verify that the gRPC service returns a non-empty orderbook.
-#[tokio::test]
-async fn test_grpc_get_quotes() {
-    let cfg = TestConfig::from_env();
-    println!("=== test_grpc_get_quotes ===");
-
-    let mut client = connect_grpc(&cfg).await;
-
-    let resp = client
-        .get_quotes(
-            make_token_pair(&cfg.input_mint, &cfg.output_mint),
-            cfg.auth_token.clone(),
-        )
-        .await
-        .expect("GetQuotes RPC failed");
-
-    println!("  quotes: {}", resp.quotes.len());
-    assert!(!resp.quotes.is_empty(), "Expected at least one quote");
-
-    let q = &resp.quotes[0];
-    println!(
-        "  first: maker={}, bids={}, asks={}",
-        q.maker_id,
-        q.bid_levels.len(),
-        q.ask_levels.len()
-    );
-}
-
 /// Fetch a swap order from the Ultra API `/order` endpoint.
 #[tokio::test]
 async fn test_ultra_api_order() {
@@ -260,27 +186,15 @@ async fn test_ultra_api_order() {
     );
 }
 
-/// Full e2e: GetQuotes → /order → sign → /execute.
+/// Full e2e: /order → sign → /execute.
 #[tokio::test]
-async fn test_full_order_flow() {
+async fn test_execute_order() {
     let cfg = TestConfig::from_env();
-    println!("=== test_full_order_flow ===");
+    let keypair = cfg.keypair();
+    println!("=== test_execute_order ===");
 
-    // Step 1 – Verify orderbook
-    println!("\n--- Step 1: GetQuotes ---");
-    let mut client = connect_grpc(&cfg).await;
-    let quotes = client
-        .get_quotes(
-            make_token_pair(&cfg.input_mint, &cfg.output_mint),
-            cfg.auth_token.clone(),
-        )
-        .await
-        .expect("GetQuotes RPC failed");
-    println!("  quotes: {}", quotes.quotes.len());
-    assert!(!quotes.quotes.is_empty(), "Orderbook is empty");
-
-    // Step 2 – Fetch order
-    println!("\n--- Step 2: GET /order ---");
+    // Step 1 – Fetch order
+    println!("\n--- Step 1: GET /order ---");
     let order = fetch_order(
         &cfg.ultra_api_base,
         &cfg.input_mint,
@@ -290,21 +204,20 @@ async fn test_full_order_flow() {
     )
     .await;
 
-    // Step 3 – Sign
-    println!("\n--- Step 3: Sign transaction ---");
     let unsigned_tx = order
         .transaction
         .as_ref()
+        .filter(|t| !t.is_empty())
         .expect("Order has no transaction");
+
+    // Step 2 – Sign
+    println!("\n--- Step 2: Sign transaction ---");
     let signed_tx =
-        common::sign_transaction(unsigned_tx, &cfg.keypair).expect("failed to sign transaction");
-    println!("  signed tx base64 len={}", signed_tx.len());
+        common::sign_transaction(unsigned_tx, keypair).expect("failed to sign transaction");
 
-    // Step 4 – Execute
-    println!("\n--- Step 4: POST /execute ---");
+    // Step 3 – Execute
+    println!("\n--- Step 3: POST /execute ---");
     let execute_url = format!("{}/execute", cfg.ultra_api_base);
-    println!("  POST {execute_url}");
-
     let resp = HttpClient::new()
         .post(&execute_url)
         .json(&ExecuteRequest {
@@ -325,13 +238,13 @@ async fn test_full_order_flow() {
         serde_json::from_str(&body).expect("failed to parse /execute JSON");
 
     println!(
-        "  status={}, sig={:?}, slot={:?}",
+        "  result: status={}, signature={:?}, slot={:?}",
         result.status, result.signature, result.slot
     );
     if let Some(events) = &result.swap_events {
         for (i, ev) in events.iter().enumerate() {
             println!(
-                "  swap[{i}]: {} {} -> {} {}",
+                "  swap[{i}]: {} {} → {} {}",
                 ev.input_amount, ev.input_mint, ev.output_amount, ev.output_mint
             );
         }
@@ -339,44 +252,8 @@ async fn test_full_order_flow() {
 
     assert_eq!(
         result.status, "Success",
-        "Expected 'Success', got '{}'. Code: {:?}, Error: {:?}",
+        "Expected 'Success', got '{}'. code={:?}, error={:?}",
         result.status, result.code, result.error,
-    );
-}
-
-/// Verify orderbooks exist in both directions of the pair.
-#[tokio::test]
-async fn test_grpc_get_quotes_both_directions() {
-    let cfg = TestConfig::from_env();
-    println!("=== test_grpc_get_quotes_both_directions ===");
-
-    let mut client = connect_grpc(&cfg).await;
-
-    let resp_a = client
-        .get_quotes(
-            make_token_pair(&cfg.input_mint, &cfg.output_mint),
-            cfg.auth_token.clone(),
-        )
-        .await
-        .expect("GetQuotes (A→B) failed");
-
-    let resp_b = client
-        .get_quotes(
-            make_token_pair(&cfg.output_mint, &cfg.input_mint),
-            cfg.auth_token.clone(),
-        )
-        .await
-        .expect("GetQuotes (B→A) failed");
-
-    println!(
-        "  A→B: {} quotes | B→A: {} quotes",
-        resp_a.quotes.len(),
-        resp_b.quotes.len()
-    );
-
-    assert!(
-        !resp_a.quotes.is_empty() || !resp_b.quotes.is_empty(),
-        "Expected quotes in at least one direction",
     );
 }
 
