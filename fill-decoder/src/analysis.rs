@@ -1,14 +1,10 @@
-//! Off-chain replay of the on-chain sweep logic for `fill_exact_in`.
 
 use crate::error::FillDecoderError;
 use crate::types::{FillAnalysis, FillExactInInstruction, Side};
 
-/// Simulate the on-chain sweep and compute the expected fill outcome.
-///
-/// This mirrors the `sweep_quote_in_for_base` / `sweep_base_in_for_quote` logic from the RFQ v2 program so MMs can verify fills locally.
 pub fn analyze_fill(ix: &FillExactInInstruction) -> crate::Result<FillAnalysis> {
     let p = &ix.params;
-    let is_bid = ix.taker_side == Side::Bid;
+    let is_bid = matches!(ix.taker_side, Side::Bid);
     let mut remaining = ix.amount_in_atoms;
     let mut bid_lots: u64 = 0;
     let mut ask_quote: u64 = 0;
@@ -25,7 +21,6 @@ pub fn analyze_fill(ix: &FillExactInInstruction) -> crate::Result<FillAnalysis> 
             .and_then(|v| v.try_into().ok())
             .ok_or_else(|| err("overflow: price_per_lot"))?;
 
-        // How many lots the taker can take from this level.
         let lots = if is_bid {
             if price_per_lot == 0 {
                 continue;
@@ -42,7 +37,6 @@ pub fn analyze_fill(ix: &FillExactInInstruction) -> crate::Result<FillAnalysis> 
             continue;
         }
 
-        // Spend quote-atoms (Bid) or base-atoms (Ask).
         let unit = if is_bid {
             price_per_lot
         } else {
@@ -55,7 +49,6 @@ pub fn analyze_fill(ix: &FillExactInInstruction) -> crate::Result<FillAnalysis> 
             .checked_sub(spend)
             .ok_or_else(|| err("underflow: remaining"))?;
 
-        // Accumulate output.
         if is_bid {
             bid_lots = bid_lots
                 .checked_add(lots)

@@ -1,4 +1,3 @@
-//! CLI tool for decoding RFQ v2 `fill_exact_in` transactions.
 
 use clap::Parser;
 
@@ -11,21 +10,16 @@ use clap::Parser;
                   decoding and fetching transactions from an RPC node."
 )]
 struct Cli {
-    /// Base-64 encoded Solana transaction (with signatures) to decode locally.
     #[arg(long, group = "input")]
     message_hash: Option<String>,
 
-    /// Transaction signature to fetch from Solana RPC and decode.
-    /// Requires the RPC_URL environment variable to be set.
     #[arg(long, group = "input")]
     tx: Option<String>,
 
-    /// Solana RPC URL (overrides the RPC_URL env var).
     #[arg(long, env = "RPC_URL")]
     rpc_url: Option<String>,
 }
 
-/// Minimal JSON-RPC request / response types (avoids pulling in a full Solana client crate).
 mod rpc {
     use serde::{Deserialize, Serialize};
 
@@ -51,12 +45,10 @@ mod rpc {
 
     #[derive(Deserialize)]
     pub struct TransactionResult {
-        /// `[data, encoding]` – we request `"base64"`.
         pub transaction: (String, String),
     }
 }
 
-/// Fetch a transaction by signature from a Solana JSON-RPC endpoint.
 async fn fetch_transaction_base64(rpc_url: &str, signature: &str) -> Result<String, String> {
     let client = reqwest::Client::new();
 

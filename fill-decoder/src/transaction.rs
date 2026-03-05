@@ -1,14 +1,18 @@
-//! Transaction and message decoding for Solana V0 / Legacy transactions.
+
+use solana_sdk::message::VersionedMessage;
+use solana_sdk::transaction::VersionedTransaction;
+use std::collections::HashMap;
+use serde::Serialize;
 
 use crate::analysis::analyze_fill;
 use crate::decode::{
-    decode_fill_instruction, is_fill_exact_in, read_u8, FILL_ACCOUNT_LABELS, RFQ_V2_PROGRAM_ID,
+    decode_fill_instruction, decode_fill_params,
+    is_fill_exact_in, FILL_ACCOUNT_LABELS, RFQ_V2_PROGRAM_ID,
 };
 use crate::error::FillDecoderError;
-use crate::scanner::scan_for_embedded_fill;
+use crate::jupiter::{is_jupiter_route, swap_kind_name, DecodedJupiterRoute, JUPITER_PROGRAM_ID};
 use crate::types::{FillAnalysis, FillExactInInstruction};
 
-/// Solana message version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageVersion {
     Legacy,
@@ -24,7 +28,6 @@ impl std::fmt::Display for MessageVersion {
     }
 }
 
-/// Solana message header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MessageHeader {
     pub num_required_signatures: u8,
@@ -32,132 +35,135 @@ pub struct MessageHeader {
     pub num_readonly_unsigned_accounts: u8,
 }
 
-/// An account resolved from the transaction's account-key list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedAccount {
-    /// Index in the message's full account list.
     pub index: u8,
-    /// Base-58 public key, or `"LookupWritable[N]"` / `"LookupReadonly[N]"`
-    /// for addresses that live in an on-chain lookup table.
     pub pubkey: String,
-    /// Whether this account signed the transaction.
     pub is_signer: bool,
-    /// Whether this account is writable.
     pub is_writable: bool,
-    /// Human-readable label (only set for `fill_exact_in` accounts).
     pub label: Option<String>,
 }
 
-/// A decoded compiled instruction.
 #[derive(Debug, Clone)]
 pub struct DecodedInstruction {
-    /// Position of this instruction in the message.
     pub instruction_index: usize,
-    /// Index of the program account in the message key list.
     pub program_id_index: u8,
-    /// Base-58 program ID.
     pub program_id: String,
-    /// Raw account indices from the compiled instruction.
     pub account_indices: Vec<u8>,
-    /// Resolved accounts with signer/writable/label metadata.
     pub accounts: Vec<ResolvedAccount>,
-    /// Raw instruction data.
     pub data: Vec<u8>,
-    /// Decoded fill + sweep analysis (present only for `fill_exact_in`).
     pub fill: Option<(FillExactInInstruction, FillAnalysis)>,
+    pub jupiter: Option<DecodedJupiterInstruction>,
 }
 
-/// An address-table lookup entry (V0 messages only).
+#[derive(Debug, Clone)]
+pub struct DecodedJupiterInstruction {
+    pub kind: String,
+    pub in_amount: u64,
+    pub quoted_out_amount: u64,
+    pub slippage_bps: u16,
+    pub platform_fee_bps: u16,
+    pub positive_slippage_bps: Option<u16>,
+    pub hops: Vec<DecodedJupiterHop>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DecodedJupiterHop {
+    pub hop_index: usize,
+    pub swap: String,
+    pub input_index: u8,
+    pub output_index: u8,
+    pub share_bps: u16,
+    pub estimated_in_amount: Option<u64>,
+    pub estimated_out_amount: Option<u64>,
+    pub rfq_fill: Option<(FillExactInInstruction, FillAnalysis)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AddressTableLookup {
-    /// Base-58 lookup-table address.
     pub account_key: String,
-    /// Indices into the table for writable accounts.
     pub writable_indexes: Vec<u8>,
-    /// Indices into the table for read-only accounts.
     pub readonly_indexes: Vec<u8>,
 }
 
-/// A fully decoded Solana message.
 #[derive(Debug, Clone)]
 pub struct DecodedMessage {
     pub version: MessageVersion,
     pub header: MessageHeader,
-    /// Base-58 static account keys.
     pub account_keys: Vec<String>,
-    /// Base-58 recent blockhash.
     pub recent_blockhash: String,
-    /// All instructions in order.
     pub instructions: Vec<DecodedInstruction>,
-    /// V0 address-table lookups (empty for Legacy).
     pub address_table_lookups: Vec<AddressTableLookup>,
 }
 
-/// A fully decoded Solana transaction (signatures + message).
 #[derive(Debug, Clone)]
 pub struct DecodedTransaction {
-    /// Base-58 signatures.
     pub signatures: Vec<String>,
-    /// The decoded message.
     pub message: DecodedMessage,
 }
 
-/// Read Solana's compact-u16 variable-length encoding.
-fn read_compact_u16(data: &[u8], offset: &mut usize) -> crate::Result<u16> {
-    let mut val: u16 = 0;
-    for i in 0..3u32 {
-        if *offset >= data.len() {
-            return Err(FillDecoderError::other(
-                "unexpected end of data reading compact-u16",
-            ));
-        }
-        let byte = data[*offset];
-        *offset += 1;
-        val |= ((byte & 0x7f) as u16) << (7 * i);
-        if byte & 0x80 == 0 {
-            return Ok(val);
-        }
-    }
-    Err(FillDecoderError::other("compact-u16 exceeded 3 bytes"))
+#[derive(Debug, Clone, Serialize)]
+pub struct MmTxSummary {
+    pub signatures: Vec<String>,
+    pub message_version: String,
+    pub instructions: Vec<MmInstructionSummary>,
 }
 
-/// Read exactly `N` bytes into a fixed-size array.
-fn read_bytes_fixed<const N: usize>(data: &[u8], offset: &mut usize) -> crate::Result<[u8; N]> {
-    if *offset + N > data.len() {
-        return Err(FillDecoderError::other(format!(
-            "unexpected end of data: need {} bytes at offset {}, have {}",
-            N,
-            *offset,
-            data.len()
-        )));
-    }
-    let mut buf = [0u8; N];
-    buf.copy_from_slice(&data[*offset..*offset + N]);
-    *offset += N;
-    Ok(buf)
+#[derive(Debug, Clone, Serialize)]
+pub struct MmInstructionSummary {
+    pub instruction_index: usize,
+    pub program_id: String,
+    pub data: Vec<u8>,
+    pub fill: Option<MmFillSummary>,
+    pub jupiter: Option<MmJupiterSummary>,
+    pub transfer: Option<MmTransferSummary>,
 }
 
-/// Read `len` bytes into a `Vec`.
-fn read_bytes_vec(data: &[u8], offset: &mut usize, len: usize) -> crate::Result<Vec<u8>> {
-    if *offset + len > data.len() {
-        return Err(FillDecoderError::other(format!(
-            "unexpected end of data: need {} bytes at offset {}, have {}",
-            len,
-            *offset,
-            data.len()
-        )));
-    }
-    let bytes = data[*offset..*offset + len].to_vec();
-    *offset += len;
-    Ok(bytes)
+#[derive(Debug, Clone, Serialize)]
+pub struct MmFillSummary {
+    pub taker_side: String,
+    pub amount_in_atoms: u64,
+    pub amount_spent_atoms: u64,
+    pub amount_out_atoms: u64,
+    pub vwap_ticks: u64,
+    pub levels_consumed: usize,
 }
 
-/// Simple hex encoder (avoids adding a hex crate).
+#[derive(Debug, Clone, Serialize)]
+pub struct MmJupiterSummary {
+    pub kind: String,
+    pub in_amount: u64,
+    pub quoted_out_amount: u64,
+    pub slippage_bps: u16,
+    pub platform_fee_bps: u16,
+    pub positive_slippage_bps: Option<u16>,
+    pub hops: Vec<MmJupiterHopSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MmJupiterHopSummary {
+    pub hop_index: usize,
+    pub swap: String,
+    pub input_index: u8,
+    pub output_index: u8,
+    pub share_bps: u16,
+    pub estimated_in_amount: Option<u64>,
+    pub estimated_out_amount: Option<u64>,
+    pub rfq_fill: Option<MmFillSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MmTransferSummary {
+    pub kind: String,
+    pub source: String,
+    pub destination: String,
+    pub authority: Option<String>,
+}
+
 pub(crate) fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-/// Decode a base-64 encoded Solana transaction (signatures + message).
 pub fn decode_transaction_base64(input: &str) -> crate::Result<DecodedTransaction> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let bytes = STANDARD
@@ -166,127 +172,229 @@ pub fn decode_transaction_base64(input: &str) -> crate::Result<DecodedTransactio
     decode_transaction_bytes(&bytes)
 }
 
-/// Decode a Solana transaction from raw bytes (signatures + message).
-pub fn decode_transaction_bytes(data: &[u8]) -> crate::Result<DecodedTransaction> {
-    let mut offset = 0;
-
-    let num_sigs = read_compact_u16(data, &mut offset)? as usize;
-    let mut signatures = Vec::with_capacity(num_sigs);
-    for _ in 0..num_sigs {
-        let sig: [u8; 64] = read_bytes_fixed(data, &mut offset)?;
-        signatures.push(bs58::encode(&sig).into_string());
-    }
-
-    let message = parse_message(data, &mut offset)?;
-
-    Ok(DecodedTransaction {
-        signatures,
-        message,
-    })
+pub fn decode_mm_tx_base64(input: &str) -> crate::Result<MmTxSummary> {
+    let tx = decode_transaction_base64(input)?;
+    Ok(filter_mm_summary(mm_summary_from_decoded_tx(&tx)))
 }
 
-/// Decode a base-64 encoded Solana message (**without** signatures).
+pub fn decode_mm_tx_base64_json(input: &str) -> crate::Result<String> {
+    let summary = decode_mm_tx_base64(input)?;
+    serde_json::to_string_pretty(&summary)
+        .map_err(|e| FillDecoderError::other(format!("failed to serialize MM summary JSON: {e}")))
+}
+
+pub fn mm_summary_from_decoded_tx(tx: &DecodedTransaction) -> MmTxSummary {
+    let instructions = tx
+        .message
+        .instructions
+        .iter()
+        .map(|ix| MmInstructionSummary {
+            instruction_index: ix.instruction_index,
+            program_id: ix.program_id.clone(),
+            data: ix.data.clone(),
+            fill: ix.fill.as_ref().map(|(fill, analysis)| MmFillSummary {
+                taker_side: fill.taker_side.to_string(),
+                amount_in_atoms: fill.amount_in_atoms,
+                amount_spent_atoms: analysis.amount_spent_atoms,
+                amount_out_atoms: analysis.amount_out_atoms,
+                vwap_ticks: analysis.vwap_ticks,
+                levels_consumed: analysis.levels_consumed,
+            }),
+            jupiter: ix.jupiter.as_ref().map(|j| MmJupiterSummary {
+                kind: j.kind.clone(),
+                in_amount: j.in_amount,
+                quoted_out_amount: j.quoted_out_amount,
+                slippage_bps: j.slippage_bps,
+                platform_fee_bps: j.platform_fee_bps,
+                positive_slippage_bps: j.positive_slippage_bps,
+                hops: j
+                    .hops
+                    .iter()
+                    .map(|h| MmJupiterHopSummary {
+                        hop_index: h.hop_index,
+                        swap: h.swap.clone(),
+                        input_index: h.input_index,
+                        output_index: h.output_index,
+                        share_bps: h.share_bps,
+                        estimated_in_amount: h.estimated_in_amount,
+                        estimated_out_amount: h.estimated_out_amount,
+                        rfq_fill: h.rfq_fill.as_ref().map(|(fill, analysis)| MmFillSummary {
+                            taker_side: fill.taker_side.to_string(),
+                            amount_in_atoms: fill.amount_in_atoms,
+                            amount_spent_atoms: analysis.amount_spent_atoms,
+                            amount_out_atoms: analysis.amount_out_atoms,
+                            vwap_ticks: analysis.vwap_ticks,
+                            levels_consumed: analysis.levels_consumed,
+                        }),
+                    })
+                    .collect(),
+            }),
+            transfer: extract_transfer_summary(ix),
+        })
+        .collect();
+
+    MmTxSummary {
+        signatures: tx.signatures.clone(),
+        message_version: tx.message.version.to_string(),
+        instructions,
+    }
+}
+
+pub fn filter_mm_summary(mut summary: MmTxSummary) -> MmTxSummary {
+    summary.instructions.retain(|ix| {
+        ix.fill.is_some() || ix.jupiter.is_some() || ix.transfer.is_some()
+    });
+    summary
+}
+
+fn read_u32_le(data: &[u8], start: usize) -> Option<u32> {
+    let end = start.checked_add(4)?;
+    let bytes = data.get(start..end)?;
+    let arr: [u8; 4] = bytes.try_into().ok()?;
+    Some(u32::from_le_bytes(arr))
+}
+
+fn extract_transfer_summary(ix: &DecodedInstruction) -> Option<MmTransferSummary> {
+    const SPL_TOKEN_PROGRAM_ID: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    const SPL_TOKEN_2022_PROGRAM_ID: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+    const SYSTEM_PROGRAM_ID: &str = "11111111111111111111111111111111";
+
+    if ix.program_id == SPL_TOKEN_PROGRAM_ID || ix.program_id == SPL_TOKEN_2022_PROGRAM_ID {
+        let tag = *ix.data.first()?;
+        match tag {
+            3 => {
+                let source = ix.accounts.first()?.pubkey.clone();
+                let destination = ix.accounts.get(1)?.pubkey.clone();
+                let authority = ix.accounts.get(2).map(|a| a.pubkey.clone());
+                Some(MmTransferSummary {
+                    kind: "spl_token_transfer".to_string(),
+                    source,
+                    destination,
+                    authority,
+                })
+            }
+            12 => {
+                let source = ix.accounts.first()?.pubkey.clone();
+                let destination = ix.accounts.get(2)?.pubkey.clone();
+                let authority = ix.accounts.get(3).map(|a| a.pubkey.clone());
+                Some(MmTransferSummary {
+                    kind: "spl_token_transfer_checked".to_string(),
+                    source,
+                    destination,
+                    authority,
+                })
+            }
+            9 => {
+                let source = ix.accounts.first()?.pubkey.clone();
+                let destination = ix.accounts.get(1)?.pubkey.clone();
+                let authority = ix.accounts.get(2).map(|a| a.pubkey.clone());
+                Some(MmTransferSummary {
+                    kind: "spl_token_close_account".to_string(),
+                    source,
+                    destination,
+                    authority,
+                })
+            }
+            _ => None,
+        }
+    } else if ix.program_id == SYSTEM_PROGRAM_ID {
+        if read_u32_le(&ix.data, 0) == Some(2) {
+            let source = ix.accounts.first()?.pubkey.clone();
+            let destination = ix.accounts.get(1)?.pubkey.clone();
+            Some(MmTransferSummary {
+                kind: "system_transfer".to_string(),
+                source,
+                destination,
+                authority: None,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+pub fn decode_transaction_bytes(data: &[u8]) -> crate::Result<DecodedTransaction> {
+    let tx: VersionedTransaction = bincode::deserialize(data)
+        .map_err(|e| FillDecoderError::other(format!("failed to deserialize transaction: {e}")))?;
+
+    let signatures: Vec<String> = tx
+        .signatures
+        .iter()
+        .map(|s| bs58::encode(s).into_string())
+        .collect();
+
+    let message = decode_versioned_message(&tx.message)?;
+
+    Ok(DecodedTransaction { signatures, message })
+}
+
 pub fn decode_message_base64(input: &str) -> crate::Result<DecodedMessage> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let bytes = STANDARD
         .decode(input)
         .map_err(|e| FillDecoderError::other(format!("invalid base64: {e}")))?;
-    let mut offset = 0;
-    parse_message(&bytes, &mut offset)
+
+    let msg: VersionedMessage = bincode::deserialize(&bytes)
+        .map_err(|e| FillDecoderError::other(format!("failed to deserialize message: {e}")))?;
+
+    decode_versioned_message(&msg)
 }
 
-/// Raw intermediate instruction before account resolution.
-struct RawInstruction {
-    program_id_index: u8,
-    account_indices: Vec<u8>,
-    data: Vec<u8>,
-}
-
-/// Raw intermediate address-table lookup.
-struct RawLookup {
-    account_key: [u8; 32],
-    writable_indexes: Vec<u8>,
-    readonly_indexes: Vec<u8>,
-}
-
-fn parse_message(data: &[u8], offset: &mut usize) -> crate::Result<DecodedMessage> {
-    if *offset >= data.len() {
-        return Err(FillDecoderError::other("empty message data"));
-    }
-
-    // Version prefix
-    let version = if data[*offset] & 0x80 != 0 {
-        *offset += 1;
-        MessageVersion::V0
-    } else {
-        MessageVersion::Legacy
-    };
-
-    // Header
-    let num_required_signatures = read_u8(data, offset)?;
-    let num_readonly_signed = read_u8(data, offset)?;
-    let num_readonly_unsigned = read_u8(data, offset)?;
-
-    let header = MessageHeader {
-        num_required_signatures,
-        num_readonly_signed_accounts: num_readonly_signed,
-        num_readonly_unsigned_accounts: num_readonly_unsigned,
-    };
-
-    // Static account keys
-    let num_static = read_compact_u16(data, offset)? as usize;
-    let mut static_keys: Vec<[u8; 32]> = Vec::with_capacity(num_static);
-    for _ in 0..num_static {
-        static_keys.push(read_bytes_fixed(data, offset)?);
-    }
-
-    // Recent blockhash
-    let blockhash: [u8; 32] = read_bytes_fixed(data, offset)?;
-
-    // Instructions (raw)
-    let num_ixs = read_compact_u16(data, offset)? as usize;
-    let mut raw_ixs: Vec<RawInstruction> = Vec::with_capacity(num_ixs);
-    for _ in 0..num_ixs {
-        let program_id_index = read_u8(data, offset)?;
-        let num_accounts = read_compact_u16(data, offset)? as usize;
-        let mut account_indices = Vec::with_capacity(num_accounts);
-        for _ in 0..num_accounts {
-            account_indices.push(read_u8(data, offset)?);
-        }
-        let data_len = read_compact_u16(data, offset)? as usize;
-        let ix_data = read_bytes_vec(data, offset, data_len)?;
-        raw_ixs.push(RawInstruction {
-            program_id_index,
-            account_indices,
-            data: ix_data,
-        });
-    }
-
-    // Address table lookups (V0 only)
-    let mut raw_lookups: Vec<RawLookup> = Vec::new();
-    if version == MessageVersion::V0 && *offset < data.len() {
-        let num_lookups = read_compact_u16(data, offset)? as usize;
-        for _ in 0..num_lookups {
-            let account_key: [u8; 32] = read_bytes_fixed(data, offset)?;
-            let nw = read_compact_u16(data, offset)? as usize;
-            let mut writable_indexes = Vec::with_capacity(nw);
-            for _ in 0..nw {
-                writable_indexes.push(read_u8(data, offset)?);
+fn decode_versioned_message(msg: &VersionedMessage) -> crate::Result<DecodedMessage> {
+    let (version, header, static_keys, recent_blockhash, instructions, address_table_lookups) =
+        match msg {
+            VersionedMessage::Legacy(legacy) => {
+                let header = MessageHeader {
+                    num_required_signatures: legacy.header.num_required_signatures,
+                    num_readonly_signed_accounts: legacy.header.num_readonly_signed_accounts,
+                    num_readonly_unsigned_accounts: legacy.header.num_readonly_unsigned_accounts,
+                };
+                (
+                    MessageVersion::Legacy,
+                    header,
+                    &legacy.account_keys[..],
+                    legacy.recent_blockhash,
+                    &legacy.instructions[..],
+                    Vec::new(),
+                )
             }
-            let nr = read_compact_u16(data, offset)? as usize;
-            let mut readonly_indexes = Vec::with_capacity(nr);
-            for _ in 0..nr {
-                readonly_indexes.push(read_u8(data, offset)?);
+            VersionedMessage::V0(v0) => {
+                let header = MessageHeader {
+                    num_required_signatures: v0.header.num_required_signatures,
+                    num_readonly_signed_accounts: v0.header.num_readonly_signed_accounts,
+                    num_readonly_unsigned_accounts: v0.header.num_readonly_unsigned_accounts,
+                };
+                let lookups: Vec<AddressTableLookup> = v0
+                    .address_table_lookups
+                    .iter()
+                    .map(|l| AddressTableLookup {
+                        account_key: bs58::encode(&l.account_key).into_string(),
+                        writable_indexes: l.writable_indexes.clone(),
+                        readonly_indexes: l.readonly_indexes.clone(),
+                    })
+                    .collect();
+                (
+                    MessageVersion::V0,
+                    header,
+                    &v0.account_keys[..],
+                    v0.recent_blockhash,
+                    &v0.instructions[..],
+                    lookups,
+                )
             }
-            raw_lookups.push(RawLookup {
-                account_key,
-                writable_indexes,
-                readonly_indexes,
-            });
-        }
-    }
+        };
 
-    let total_writable_lookups: usize = raw_lookups.iter().map(|l| l.writable_indexes.len()).sum();
+    let num_static = static_keys.len();
+    let num_required_signatures = header.num_required_signatures as usize;
+    let num_readonly_signed = header.num_readonly_signed_accounts as usize;
+    let num_readonly_unsigned = header.num_readonly_unsigned_accounts as usize;
+
+    let total_writable_lookups: usize = address_table_lookups
+        .iter()
+        .map(|l| l.writable_indexes.len())
+        .sum();
     let writable_lookup_end = num_static + total_writable_lookups;
 
     let account_keys: Vec<String> = static_keys
@@ -294,17 +402,16 @@ fn parse_message(data: &[u8], offset: &mut usize) -> crate::Result<DecodedMessag
         .map(|k| bs58::encode(k).into_string())
         .collect();
 
-    let recent_blockhash = bs58::encode(&blockhash).into_string();
+    let recent_blockhash_str = bs58::encode(&recent_blockhash).into_string();
 
-    // Helper closure: resolve one account index
     let resolve = |idx: u8| -> ResolvedAccount {
         let i = idx as usize;
         if i < num_static {
-            let is_signer = i < num_required_signatures as usize;
+            let is_signer = i < num_required_signatures;
             let is_writable = if is_signer {
-                i < (num_required_signatures.saturating_sub(num_readonly_signed)) as usize
+                i < num_required_signatures.saturating_sub(num_readonly_signed)
             } else {
-                i < num_static.saturating_sub(num_readonly_unsigned as usize)
+                i < num_static.saturating_sub(num_readonly_unsigned)
             };
             ResolvedAccount {
                 index: idx,
@@ -332,37 +439,41 @@ fn parse_message(data: &[u8], offset: &mut usize) -> crate::Result<DecodedMessag
         }
     };
 
-    // Resolve instructions
-    let instructions: Vec<DecodedInstruction> = raw_ixs
-        .into_iter()
+    let decoded_instructions: Vec<DecodedInstruction> = instructions
+        .iter()
         .enumerate()
-        .map(|(ix_idx, raw)| {
-            let program_id = if (raw.program_id_index as usize) < account_keys.len() {
-                account_keys[raw.program_id_index as usize].clone()
+        .map(|(ix_idx, ix)| {
+            let program_id = if (ix.program_id_index as usize) < account_keys.len() {
+                account_keys[ix.program_id_index as usize].clone()
             } else {
-                format!("Unknown(index={})", raw.program_id_index)
+                format!("Unknown(index={})", ix.program_id_index)
             };
 
             let is_rfq_program = program_id == RFQ_V2_PROGRAM_ID;
-            let is_direct_fill = is_fill_exact_in(&raw.data);
-
-            // Auto-detect fill: either a direct fill_exact_in instruction,
-            // or an embedded fill within a CPI caller (e.g. Jupiter route).
-            let fill = if is_direct_fill {
-                decode_fill_instruction(&raw.data)
-                    .ok()
-                    .and_then(|ix| analyze_fill(&ix).ok().map(|a| (ix, a)))
+            let is_jupiter_program = program_id == JUPITER_PROGRAM_ID.to_string();
+            let is_direct_fill = is_fill_exact_in(&ix.data);
+            let jupiter = if is_jupiter_program && is_jupiter_route(&ix.data) {
+                decode_jupiter_instruction(&ix.data)
             } else {
-                scan_for_embedded_fill(&raw.data)
+                None
             };
 
-            let accounts: Vec<ResolvedAccount> = raw
-                .account_indices
+            let fill = if is_direct_fill {
+                decode_fill_instruction(&ix.data)
+                    .ok()
+                    .and_then(|fill_ix| analyze_fill(&fill_ix).ok().map(|a| (fill_ix, a)))
+            } else {
+                jupiter
+                    .as_ref()
+                    .and_then(|j| j.hops.iter().find_map(|h| h.rfq_fill.clone()))
+            };
+
+            let accounts: Vec<ResolvedAccount> = ix
+                .accounts
                 .iter()
                 .enumerate()
                 .map(|(pos, &idx)| {
                     let mut acct = resolve(idx);
-                    // Label accounts for direct fill instructions
                     if is_direct_fill && is_rfq_program && pos < FILL_ACCOUNT_LABELS.len() {
                         acct.label = Some(FILL_ACCOUNT_LABELS[pos].to_string());
                     }
@@ -372,22 +483,14 @@ fn parse_message(data: &[u8], offset: &mut usize) -> crate::Result<DecodedMessag
 
             DecodedInstruction {
                 instruction_index: ix_idx,
-                program_id_index: raw.program_id_index,
+                program_id_index: ix.program_id_index,
                 program_id,
-                account_indices: raw.account_indices,
+                account_indices: ix.accounts.clone(),
                 accounts,
-                data: raw.data,
+                data: ix.data.clone(),
                 fill,
+                jupiter,
             }
-        })
-        .collect();
-
-    let address_table_lookups: Vec<AddressTableLookup> = raw_lookups
-        .into_iter()
-        .map(|l| AddressTableLookup {
-            account_key: bs58::encode(&l.account_key).into_string(),
-            writable_indexes: l.writable_indexes,
-            readonly_indexes: l.readonly_indexes,
         })
         .collect();
 
@@ -395,9 +498,131 @@ fn parse_message(data: &[u8], offset: &mut usize) -> crate::Result<DecodedMessag
         version,
         header,
         account_keys,
-        recent_blockhash,
-        instructions,
+        recent_blockhash: recent_blockhash_str,
+        instructions: decoded_instructions,
         address_table_lookups,
+    })
+}
+
+fn mul_div_u64(amount: u64, numerator: u64, denominator: u64) -> u64 {
+    ((amount as u128) * (numerator as u128) / (denominator as u128)) as u64
+}
+
+fn decode_jupiter_instruction(data: &[u8]) -> Option<DecodedJupiterInstruction> {
+    let route = DecodedJupiterRoute::decode(data)?;
+
+    let mut known_amounts: HashMap<u8, u64> = HashMap::new();
+    known_amounts.insert(0, route.in_amount());
+
+    let mut hops = Vec::new();
+
+    let mut push_hop = |hop_index: usize,
+                        swap: &crate::jupiter::Swap,
+                        input_index: u8,
+                        output_index: u8,
+                        share_bps: u16| {
+        let estimated_in_amount = known_amounts
+            .get(&input_index)
+            .copied()
+            .map(|amount| mul_div_u64(amount, share_bps as u64, 10_000));
+
+        let mut estimated_out_amount = None;
+        let mut rfq_fill = None;
+
+        if let crate::jupiter::Swap::JupiterRfqV2 { side, fill_data } = swap {
+            let params = decode_fill_params(fill_data).ok();
+            if let Some(params) = params {
+                let taker_side = match side {
+                    crate::jupiter::Side::Bid => crate::types::Side::Bid,
+                    crate::jupiter::Side::Ask => crate::types::Side::Ask,
+                };
+                let amount_in_atoms = estimated_in_amount.unwrap_or(route.in_amount());
+                let fill_ix = FillExactInInstruction {
+                    taker_side,
+                    amount_in_atoms,
+                    params,
+                };
+                if let Ok(analysis) = analyze_fill(&fill_ix) {
+                    estimated_out_amount = Some(analysis.amount_out_atoms);
+                    rfq_fill = Some((fill_ix, analysis));
+                }
+            }
+        }
+
+        if let Some(out) = estimated_out_amount {
+            known_amounts
+                .entry(output_index)
+                .and_modify(|x| *x = x.saturating_add(out))
+                .or_insert(out);
+        }
+
+        hops.push(DecodedJupiterHop {
+            hop_index,
+            swap: swap_kind_name(swap),
+            input_index,
+            output_index,
+            share_bps,
+            estimated_in_amount,
+            estimated_out_amount,
+            rfq_fill,
+        });
+    };
+
+    match &route {
+        DecodedJupiterRoute::Route { route_plan, .. } => {
+            for (hop_index, step) in route_plan.iter().enumerate() {
+                push_hop(
+                    hop_index,
+                    &step.swap,
+                    step.input_index,
+                    step.output_index,
+                    (step.percent as u16) * 100,
+                );
+            }
+        }
+        DecodedJupiterRoute::SharedAccountsRoute { route_plan, .. } => {
+            for (hop_index, step) in route_plan.iter().enumerate() {
+                push_hop(
+                    hop_index,
+                    &step.swap,
+                    step.input_index,
+                    step.output_index,
+                    (step.percent as u16) * 100,
+                );
+            }
+        }
+        DecodedJupiterRoute::RouteV2 { route_plan, .. } => {
+            for (hop_index, step) in route_plan.iter().enumerate() {
+                push_hop(
+                    hop_index,
+                    &step.swap,
+                    step.input_index,
+                    step.output_index,
+                    step.bps,
+                );
+            }
+        }
+        DecodedJupiterRoute::SharedAccountsRouteV2 { route_plan, .. } => {
+            for (hop_index, step) in route_plan.iter().enumerate() {
+                push_hop(
+                    hop_index,
+                    &step.swap,
+                    step.input_index,
+                    step.output_index,
+                    step.bps,
+                );
+            }
+        }
+    }
+
+    Some(DecodedJupiterInstruction {
+        kind: route.kind_name().to_string(),
+        in_amount: route.in_amount(),
+        quoted_out_amount: route.quoted_out_amount(),
+        slippage_bps: route.slippage_bps(),
+        platform_fee_bps: route.platform_fee_bps(),
+        positive_slippage_bps: route.positive_slippage_bps(),
+        hops,
     })
 }
 
@@ -548,6 +773,32 @@ impl std::fmt::Display for DecodedInstruction {
                 "    Effective price: {:.6} quote-atoms/base-atom",
                 analysis.effective_price()
             )?;
+        }
+
+        if let Some(jupiter) = &self.jupiter {
+            writeln!(f, "    --- Jupiter Route ---")?;
+            writeln!(f, "    Kind:            {}", jupiter.kind)?;
+            writeln!(f, "    In amount:       {} atoms", jupiter.in_amount)?;
+            writeln!(f, "    Quoted out:      {} atoms", jupiter.quoted_out_amount)?;
+            writeln!(f, "    Slippage:        {} bps", jupiter.slippage_bps)?;
+            writeln!(f, "    Platform fee:    {} bps", jupiter.platform_fee_bps)?;
+            if let Some(ps) = jupiter.positive_slippage_bps {
+                writeln!(f, "    Positive slip.:  {} bps", ps)?;
+            }
+            writeln!(f, "    Hops ({}):", jupiter.hops.len())?;
+            for hop in &jupiter.hops {
+                writeln!(
+                    f,
+                    "      #{} {} [{} -> {}] share={}bps in={:?} out={:?}",
+                    hop.hop_index,
+                    hop.swap,
+                    hop.input_index,
+                    hop.output_index,
+                    hop.share_bps,
+                    hop.estimated_in_amount,
+                    hop.estimated_out_amount,
+                )?;
+            }
         }
 
         Ok(())
