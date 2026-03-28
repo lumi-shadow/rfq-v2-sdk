@@ -179,6 +179,9 @@ impl ReconnectingQuoteStreamHandle {
                     self.try_reconnect().await?;
                 }
                 Err(e) => {
+                    if e.is_timeout_error() {
+                        return Err(e);
+                    }
                     if self.closed.load(Ordering::Acquire) {
                         return Err(e);
                     }
@@ -344,6 +347,9 @@ impl ReconnectingSwapStreamHandle {
                     self.try_reconnect().await?;
                 }
                 Err(e) => {
+                    if e.is_timeout_error() {
+                        return Err(e);
+                    }
                     if self.closed.load(Ordering::Acquire) {
                         return Err(e);
                     }
