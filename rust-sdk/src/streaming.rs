@@ -29,9 +29,9 @@ impl QuoteStreamHandle {
     pub(crate) fn new(
         quote_sender: tokio::sync::mpsc::UnboundedSender<MarketMakerQuote>,
         update_receiver: Streaming<QuoteUpdate>,
+        stats: Arc<Mutex<ConnectionStats>>,
     ) -> Self {
         let shutdown = Arc::new(Notify::new());
-        let stats = Arc::new(Mutex::new(ConnectionStats::new()));
         let is_closed = Arc::new(Mutex::new(false));
 
         Self {
@@ -217,6 +217,10 @@ pub struct StreamConfig {
     pub auto_reconnect: bool,
     /// Maximum number of reconnection attempts
     pub max_reconnect_attempts: u32,
+    /// Delay before the first reconnect attempt (then doubled until [`Self::reconnect_max_delay`])
+    pub reconnect_initial_delay: std::time::Duration,
+    /// Upper bound for exponential backoff between reconnect attempts
+    pub reconnect_max_delay: std::time::Duration,
     /// Maximum duration of inactivity before considering connection unhealthy
     pub inactivity_timeout: std::time::Duration,
 }
@@ -228,6 +232,8 @@ impl Default for StreamConfig {
             operation_timeout: std::time::Duration::from_secs(30),
             auto_reconnect: false,
             max_reconnect_attempts: 3,
+            reconnect_initial_delay: std::time::Duration::from_secs(1),
+            reconnect_max_delay: std::time::Duration::from_secs(60),
             inactivity_timeout: std::time::Duration::from_secs(120),
         }
     }
@@ -255,6 +261,18 @@ impl StreamConfig {
     pub fn with_auto_reconnect(mut self, max_attempts: u32) -> Self {
         self.auto_reconnect = true;
         self.max_reconnect_attempts = max_attempts;
+        self
+    }
+
+    /// Initial delay before a reconnect attempt and base for exponential backoff
+    pub fn with_reconnect_initial_delay(mut self, delay: std::time::Duration) -> Self {
+        self.reconnect_initial_delay = delay;
+        self
+    }
+
+    /// Maximum delay between reconnect attempts (cap for exponential backoff)
+    pub fn with_reconnect_max_delay(mut self, delay: std::time::Duration) -> Self {
+        self.reconnect_max_delay = delay;
         self
     }
 
@@ -311,9 +329,10 @@ impl ConnectionStats {
         self.errors_encountered += 1;
     }
 
-    /// Record a reconnection
+    /// Record a reconnection (resets [`Self::connected_at`] for the new physical stream)
     pub fn reconnection(&mut self) {
         self.reconnections += 1;
+        self.connected_at = std::time::Instant::now();
     }
 
     /// Get time since last activity
@@ -473,9 +492,9 @@ impl SwapStreamHandle {
     pub(crate) fn new(
         swap_sender: tokio::sync::mpsc::UnboundedSender<MarketMakerSwap>,
         update_receiver: Streaming<SwapUpdate>,
+        stats: Arc<Mutex<SwapStats>>,
     ) -> Self {
         let shutdown = Arc::new(Notify::new());
-        let stats = Arc::new(Mutex::new(SwapStats::new()));
         let is_closed = Arc::new(Mutex::new(false));
 
         Self {

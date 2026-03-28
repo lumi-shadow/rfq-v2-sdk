@@ -6,6 +6,7 @@
 pub mod builders;
 pub mod client;
 pub mod error;
+pub mod reconnecting;
 pub mod reflection;
 pub mod streaming;
 pub mod types;
@@ -21,6 +22,7 @@ pub const FILE_DESCRIPTOR_SET: &[u8] =
 pub use builders::*;
 pub use client::MarketMakerClient;
 pub use error::{MarketMakerError, Result};
+pub use reconnecting::{ReconnectingQuoteStreamHandle, ReconnectingSwapStreamHandle};
 pub use streaming::*;
 pub use types::*;
 

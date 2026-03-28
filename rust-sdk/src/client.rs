@@ -2,10 +2,11 @@
 
 use crate::error::{MarketMakerError, Result};
 use crate::market_maker::market_maker_ingestion_service_client::MarketMakerIngestionServiceClient;
-use crate::streaming::{QuoteStreamHandle, StreamConfig};
+use crate::streaming::{QuoteStreamHandle, StreamConfig, SwapStreamHandle};
 use crate::types::*;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint};
 use tonic::Request;
@@ -100,7 +101,22 @@ impl MarketMakerClient {
     #[instrument(skip(self))]
     pub async fn start_streaming_with_config(
         &mut self,
+        config: &StreamConfig,
+    ) -> Result<QuoteStreamHandle> {
+        self.start_streaming_with_config_and_stats(
+            config,
+            Arc::new(Mutex::new(crate::streaming::ConnectionStats::new())),
+        )
+        .await
+    }
+
+    /// Same as [`Self::start_streaming_with_config`] but shares [`crate::streaming::ConnectionStats`]
+    /// across stream replacements (used by reconnecting wrappers).
+    #[instrument(skip(self, stats))]
+    pub(crate) async fn start_streaming_with_config_and_stats(
+        &mut self,
         _config: &StreamConfig,
+        stats: Arc<Mutex<crate::streaming::ConnectionStats>>,
     ) -> Result<QuoteStreamHandle> {
         info!("Starting bidirectional gRPC streaming connection");
 
@@ -125,12 +141,23 @@ impl MarketMakerClient {
 
         debug!("gRPC streaming connection established successfully");
 
-        Ok(QuoteStreamHandle::new(quote_tx, update_stream))
+        Ok(QuoteStreamHandle::new(quote_tx, update_stream, stats))
     }
 
     /// Start a bidirectional gRPC streaming connection for swap updates
     #[instrument(skip(self))]
-    pub async fn start_swap_streaming(&mut self) -> Result<crate::streaming::SwapStreamHandle> {
+    pub async fn start_swap_streaming(&mut self) -> Result<SwapStreamHandle> {
+        self.start_swap_streaming_with_stats(Arc::new(Mutex::new(
+            crate::streaming::SwapStats::new(),
+        )))
+        .await
+    }
+
+    #[instrument(skip(self, stats))]
+    pub(crate) async fn start_swap_streaming_with_stats(
+        &mut self,
+        stats: Arc<Mutex<crate::streaming::SwapStats>>,
+    ) -> Result<SwapStreamHandle> {
         info!("Starting bidirectional gRPC swap streaming connection");
 
         // Create an unbounded channel for swap sending
@@ -150,10 +177,7 @@ impl MarketMakerClient {
 
         debug!("gRPC swap streaming connection established successfully");
 
-        Ok(crate::streaming::SwapStreamHandle::new(
-            swap_tx,
-            update_stream,
-        ))
+        Ok(SwapStreamHandle::new(swap_tx, update_stream, stats))
     }
 
     /// Get a copy of the client configuration
